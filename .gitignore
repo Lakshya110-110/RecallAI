@@ -18,3 +18,5 @@ frontend/dist/
 __pycache__/
 .pytest_cache/
 .venv/
+.neon
+node_modules/
