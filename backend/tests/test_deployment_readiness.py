@@ -559,3 +559,469 @@ def test_retry_processing_does_not_duplicate_reports_or_keywords(monkeypatch):
         ).all()
         assert len(c1_kws) == 5
 
+
+
+# ---------------------------------------------------------------------------
+# C4 Assessment JSON Parsing, Fallback Model, and TES End-to-End Tests
+# ---------------------------------------------------------------------------
+
+
+def test_c4_assess_valid_json_and_fenced_json_responses(monkeypatch):
+    """
+    Test:
+    - Valid JSON response matching NvidiaC4MatchResponse
+    - Valid JSON wrapped in Markdown fences and surrounded by explanatory text
+    - Request configuration: no response_format=json_object on Nemotron, enable_thinking=False, max_tokens=1536
+    - Safe inspection of finish_reason, content, reasoning_content, and token usage
+    """
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-c4-test-key")
+    monkeypatch.setenv("NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    captured_calls: list[dict] = []
+
+    class FakeUsage:
+        prompt_tokens = 180
+        completion_tokens = 95
+        total_tokens = 275
+        completion_tokens_details = type("Details", (), {"reasoning_tokens": 0})()
+
+    class FakeChoice:
+        def __init__(self, content: str):
+            self.finish_reason = "stop"
+            self.message = type("Msg", (), {"content": content, "reasoning_content": None})()
+
+    class FakeResponse:
+        def __init__(self, content: str):
+            self.choices = [FakeChoice(content)]
+            self.usage = FakeUsage()
+
+    class FakeChatCompletions:
+        def create(self, **kwargs):
+            captured_calls.append(kwargs)
+            return FakeResponse(
+                "Here is the evaluation of the reflection:\n```json\n"
+                + json.dumps({
+                    "concept_results": [
+                        {
+                            "concept": "Triple Exponential Smoothing",
+                            "status": "recalled",
+                            "evidence": "We applied Triple Exponential Smoothing to smooth level, trend, and seasonality.",
+                            "explanation": "Demonstrated TES components.",
+                        },
+                        {
+                            "concept": "Mean Absolute Percentage Error",
+                            "status": "missing",
+                            "evidence": "N/A",
+                            "explanation": "Not mentioned in reflection.",
+                        },
+                    ],
+                    "feedback": "Good explanation of Triple Exponential Smoothing.",
+                })
+                + "\n```\nEnd of evaluation."
+            )
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = type("Chat", (), {"completions": FakeChatCompletions()})()
+
+    monkeypatch.setattr(main, "nvidia_c4_assess", _REAL_NVIDIA_C4_ASSESS)
+    monkeypatch.setattr(main, "OpenAI", FakeOpenAI)
+
+    lesson = Lesson(id=1, title="TES Session", subject="Business Forecasting", assessment_mode="c4")
+    submission = Submission(
+        id=1,
+        lesson_id=1,
+        student_id=2,
+        text="We applied Triple Exponential Smoothing to smooth level, trend, and seasonality.",
+        character_count=80,
+    )
+    pool_data = {
+        "distinct_concepts": [
+            {"display_concept": "Triple Exponential Smoothing"},
+            {"display_concept": "Mean Absolute Percentage Error"},
+        ]
+    }
+
+    resp = main.nvidia_c4_assess(lesson, submission, pool_data)
+    assert len(captured_calls) == 1
+    assert "response_format" not in captured_calls[0]
+    assert captured_calls[0]["max_tokens"] == 1536
+    assert captured_calls[0]["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+    assert len(resp.concept_results) == 2
+    assert resp.concept_results[0].concept == "Triple Exponential Smoothing"
+    assert resp.concept_results[0].status == "recalled"
+    assert resp.concept_results[1].status == "missing"
+    assert resp.concept_results[1].evidence == ""  # "N/A" coerced to ""
+    assert resp.feedback == "Good explanation of Triple Exponential Smoothing."
+
+
+def test_c4_assess_empty_corrupted_reasoning_only_and_truncated_responses():
+    """
+    Test _parse_and_validate_c4_match_response and _extract_assistant_content on:
+    - Empty response
+    - Corrupted response
+    - Reasoning-only response (never parses reasoning_content as final JSON)
+    - Truncated response (finish_reason=length)
+    """
+    # 1. Empty responses
+    for empty_val in [None, "", "   \n\t ", "```json\n  \n```", "<think>Only thinking</think>"]:
+        with pytest.raises(ValueError, match="Empty"):
+            main._parse_and_validate_c4_match_response(empty_val)
+
+    # 2. Corrupted responses & bare "{}" without concept_results
+    for corrupt_val in [
+        "—¡(). blant wówczasloxacinメリカ'agost\ufffd'IGN'IGN pobo'IGN",
+        " mp copy)\t 1",
+        "\ufffd\ufffd{U.",
+        "Not JSON at all",
+    ]:
+        with pytest.raises(ValueError, match="Invalid JSON"):
+            main._parse_and_validate_c4_match_response(corrupt_val)
+
+    with pytest.raises(ValueError, match="concept_results"):
+        main._parse_and_validate_c4_match_response("{}")
+
+    # 3. Reasoning-only response: even if reasoning_content contains valid JSON, it MUST NEVER be parsed!
+    reasoning_json = json.dumps({
+        "concept_results": [{"concept": "TES", "status": "recalled", "evidence": "", "explanation": "from reasoning"}],
+        "feedback": "Should never be parsed from reasoning_content",
+    })
+    msg_reasoning_only = type("Msg", (), {"content": None, "reasoning_content": reasoning_json})()
+    choice_reasoning_only = type("Choice", (), {"message": msg_reasoning_only, "finish_reason": "stop"})()
+    resp_reasoning_only = type("Resp", (), {"choices": [choice_reasoning_only], "usage": None})()
+
+    extracted = document_processing._extract_assistant_content(resp_reasoning_only)
+    assert extracted is None
+    diag = document_processing._inspect_response_diagnostics(resp_reasoning_only, extracted)
+    assert diag["reasoning_only"] is True
+    assert diag["has_reasoning_content"] is True
+    assert diag["content_is_none"] is True
+
+    # Unclosed <think> block inside content must also never be parsed as JSON
+    unclosed_think = f"<think>Thinking about {reasoning_json} before finishing"
+    with pytest.raises(ValueError, match="Empty"):
+        main._parse_and_validate_c4_match_response(unclosed_think)
+
+    # 4. Truncated response (finish_reason="length")
+    truncated_json = '{"concept_results": [{"concept": "Triple Exponential Smoothing", "status": "recalled"'
+    with pytest.raises(ValueError, match="Truncated JSON response.*finish_reason=length"):
+        main._parse_and_validate_c4_match_response(truncated_json, finish_reason="length")
+
+
+def test_c4_assess_fallback_model_and_intelligent_retry_on_corrupted_or_timeout(monkeypatch):
+    """
+    Test:
+    - Primary model (nvidia/nemotron-3-ultra-550b-a55b) returns corrupted/reasoning-only output or times out on Attempt 1.
+    - Attempt 2 switches to controlled fallback model (nvidia/nemotron-3.5-bolt-e4b) with adaptive retry prompt (never sending identical request).
+    - If all attempts fail (e.g., persistent API timeout or truncated/corrupted output), raises a clear RuntimeError with redacted secrets.
+    """
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-secret-c4-token")
+    monkeypatch.setenv("NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
+    monkeypatch.setenv("NVIDIA_FALLBACK_MODEL", "nvidia/nemotron-3.5-bolt-e4b")
+    monkeypatch.setenv("NVIDIA_MAX_RETRIES", "2")
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.setattr(main, "nvidia_c4_assess", _REAL_NVIDIA_C4_ASSESS)
+
+    calls: list[dict] = []
+
+    class FakeChoice:
+        def __init__(self, content: str | None, reasoning_content: str | None = None, finish_reason: str = "stop"):
+            self.finish_reason = finish_reason
+            self.message = type("Msg", (), {"content": content, "reasoning_content": reasoning_content})()
+
+    class FakeResponse:
+        def __init__(self, content: str | None, reasoning_content: str | None = None, finish_reason: str = "stop"):
+            self.choices = [FakeChoice(content, reasoning_content, finish_reason)]
+            self.usage = {"prompt_tokens": 120, "completion_tokens": 45, "total_tokens": 165}
+
+    class FallbackSuccessCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                # Primary model returns content=None and corrupted reasoning_content
+                return FakeResponse(content=None, reasoning_content=" mp copy)\t 1", finish_reason="stop")
+            # Fallback model returns valid JSON
+            return FakeResponse(
+                content=json.dumps({
+                    "concept_results": [
+                        {
+                            "concept": "Triple Exponential Smoothing",
+                            "status": "recalled",
+                            "evidence": "TES smooths level, trend, and seasonality.",
+                            "explanation": "Correctly explained TES.",
+                        }
+                    ],
+                    "feedback": "Strong understanding of TES.",
+                })
+            )
+
+    class FallbackSuccessOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = type("Chat", (), {"completions": FallbackSuccessCompletions()})()
+
+    monkeypatch.setattr(main, "OpenAI", FallbackSuccessOpenAI)
+
+    lesson = Lesson(id=10, title="Fallback Test Session", subject="Business Forecasting", assessment_mode="c4")
+    submission = Submission(
+        id=10,
+        lesson_id=10,
+        student_id=3,
+        text="TES smooths level, trend, and seasonality.",
+        character_count=42,
+    )
+    pool_data = {"distinct_concepts": [{"display_concept": "Triple Exponential Smoothing"}]}
+
+    res = main.nvidia_c4_assess(lesson, submission, pool_data)
+    assert len(calls) == 2
+    assert calls[0]["model"] == "nvidia/nemotron-3-ultra-550b-a55b"
+    assert calls[1]["model"] == "nvidia/nemotron-3.5-bolt-e4b"
+    # Verify retry request was modified (not identical)
+    assert calls[0]["messages"][0]["content"] != calls[1]["messages"][0]["content"]
+    assert "IMPORTANT RETRY INSTRUCTION" in calls[1]["messages"][0]["content"]
+    assert getattr(res, "_model_used", None) == "nvidia/nemotron-3.5-bolt-e4b"
+    assert len(res.concept_results) == 1
+    assert res.concept_results[0].status == "recalled"
+
+    # Now test truncation on attempt 1 -> increases max_tokens on attempt 2
+    trunc_calls: list[dict] = []
+
+    class TruncatedThenSuccessCompletions:
+        def create(self, **kwargs):
+            trunc_calls.append(kwargs)
+            if len(trunc_calls) == 1:
+                return FakeResponse(
+                    content='{"concept_results": [{"concept": "Triple Exponential Smoothing"',
+                    finish_reason="length",
+                )
+            return FakeResponse(
+                content=json.dumps({
+                    "concept_results": [
+                        {
+                            "concept": "Triple Exponential Smoothing",
+                            "status": "recalled",
+                            "evidence": "TES smooths level, trend, and seasonality.",
+                            "explanation": "Matched.",
+                        }
+                    ],
+                    "feedback": "Recovered from truncation.",
+                })
+            )
+
+    class TruncatedOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = type("Chat", (), {"completions": TruncatedThenSuccessCompletions()})()
+
+    monkeypatch.setattr(main, "OpenAI", TruncatedOpenAI)
+    res_trunc = main.nvidia_c4_assess(lesson, submission, pool_data)
+    assert len(trunc_calls) == 2
+    assert trunc_calls[1]["max_tokens"] > trunc_calls[0]["max_tokens"]
+    assert res_trunc.feedback == "Recovered from truncation."
+
+    # Now test API timeout on all attempts -> raises clear RuntimeError with redacted secret
+    class AlwaysTimeoutCompletions:
+        def create(self, **kwargs):
+            raise TimeoutError("Timed out calling integrate.api.nvidia.com with nvapi-secret-c4-token")
+
+    class AlwaysTimeoutOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = type("Chat", (), {"completions": AlwaysTimeoutCompletions()})()
+
+    monkeypatch.setattr(main, "OpenAI", AlwaysTimeoutOpenAI)
+    with pytest.raises(RuntimeError) as exc_info:
+        main.nvidia_c4_assess(lesson, submission, pool_data)
+    err_msg = str(exc_info.value)
+    assert "NVIDIA C4 assessment failed after 2 attempt(s)" in err_msg
+    assert "nvidia/nemotron-3-ultra-550b-a55b" in err_msg
+    assert "nvidia/nemotron-3.5-bolt-e4b" in err_msg
+    assert "nvapi-secret-c4-token" not in err_msg
+    assert "nvapi-[REDACTED]" in err_msg
+
+
+def test_end_to_end_c4_assessment_sample_tes_reflection_with_fallback_model(monkeypatch):
+    """
+    Actual end-to-end C4 assessment using a sample TES reflection through the real nvidia_c4_assess pipeline
+    (where primary model returns corrupted non-JSON and fallback model returns valid NvidiaC4MatchResponse JSON):
+    - Preserves keyword matching, evidence extraction, scoring bands, and faculty review functionality.
+    """
+    monkeypatch.setenv("FACULTY_SIGNUP_CODE", "011002")
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-e2e-test-key")
+    monkeypatch.setenv("NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
+    monkeypatch.setenv("NVIDIA_FALLBACK_MODEL", "nvidia/nemotron-3.5-bolt-e4b")
+    monkeypatch.setenv("NVIDIA_MAX_RETRIES", "2")
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    def reg_login(name: str, role: str):
+        email = f"tes-e2e-{uuid.uuid4().hex[:8]}@rvu.edu.in"
+        pw = "password-12345"
+        r = client.post(
+            "/auth/register",
+            json={
+                "name": name,
+                "email": email,
+                "password": pw,
+                "confirm_password": pw,
+                "role": role,
+                "signup_code": "011002" if role in {"faculty", "contributor"} else None,
+            },
+        )
+        assert r.status_code == 201
+        tok = client.post("/auth/login", json={"email": email, "password": pw, "expected_role": role}).json()["token"]
+        return r.json()["user"]["id"], {"Authorization": f"Bearer {tok}"}
+
+    _, fac_headers = reg_login("Prof. TES", "faculty")
+    c1_id, c1_headers = reg_login("TES Contrib 1", "contributor")
+    c2_id, c2_headers = reg_login("TES Contrib 2", "contributor")
+    c3_id, c3_headers = reg_login("TES Contrib 3", "contributor")
+    _, stu_headers = reg_login("TES Learner", "student")
+
+    lesson_id = client.post(
+        "/lessons",
+        headers=fac_headers,
+        json={
+            "title": "TES Forecasting End-to-End Session",
+            "subject": "Business Forecasting",
+            "assessment_mode": "c4",
+            "contributor_ids": [c1_id, c2_id, c3_id],
+        },
+    ).json()["id"]
+
+    kws_by_contrib = {
+        1: ["TES model", "MAPE", "Seasonal Index", "Forecast Horizon", "Holdout Validation"],
+        2: ["Triple Exponential Smoothing", "Mean Absolute Percentage Error", "Autocorrelation Function", "Tracking Signal", "Prediction Intervals"],
+        3: ["Root Mean Squared Error", "Partial Autocorrelation Function", "Seasonal ARIMA", "Demand Elasticity", "Residual Diagnostics"],
+    }
+    for idx, hdrs in enumerate([c1_headers, c2_headers, c3_headers], start=1):
+        monkeypatch.setattr(
+            document_processing,
+            "call_nemotron_keyword_extraction",
+            lambda document_text, subject="Business Forecasting", i=idx: json.dumps({"keywords": kws_by_contrib[i]}),
+        )
+        res = client.post(
+            f"/lessons/{lesson_id}/reference-reports",
+            headers=hdrs,
+            json={
+                "title": f"TES Report {idx}",
+                "content": f"Reference report {idx} on Triple Exponential Smoothing, MAPE, RMSE, and seasonal forecasting.",
+            },
+        )
+        assert res.status_code == 201
+
+    sample_tes_reflection = (
+        "We applied the TES model (Holt-Winters Triple Exponential Smoothing) to smooth level, trend, "
+        "and seasonal components across our forecast horizon. We evaluated accuracy using Mean Absolute "
+        "Percentage Error and Root Mean Squared Error during holdout validation, while prediction intervals "
+        "quantified uncertainty and tracking signals monitored forecast bias."
+    )
+
+    # Wire real nvidia_c4_assess with FakeOpenAI that simulates primary model failure -> fallback model success
+    class FakeChoice:
+        def __init__(self, content: str | None, reasoning_content: str | None = None):
+            self.finish_reason = "stop"
+            self.message = type("Msg", (), {"content": content, "reasoning_content": reasoning_content})()
+
+    class FakeResponse:
+        def __init__(self, content: str | None, reasoning_content: str | None = None):
+            self.choices = [FakeChoice(content, reasoning_content)]
+            self.usage = {"prompt_tokens": 210, "completion_tokens": 320, "total_tokens": 530}
+
+    class E2ECompletions:
+        def create(self, **kwargs):
+            if kwargs["model"] == "nvidia/nemotron-3-ultra-550b-a55b":
+                # Simulate corrupted output on primary model
+                return FakeResponse(content="—¡(). blant wówczasloxacin")
+            # Fallback model returns valid structured JSON wrapped in markdown fences
+            return FakeResponse(
+                content="```json\n"
+                + json.dumps({
+                    "concept_results": [
+                        {
+                            "concept": "Triple Exponential Smoothing",
+                            "status": "recalled",
+                            "evidence": "We applied the TES model (Holt-Winters Triple Exponential Smoothing) to smooth level, trend, and seasonal components across our forecast horizon.",
+                            "explanation": "Demonstrated TES smoothing level, trend, and seasonality.",
+                        },
+                        {
+                            "concept": "Forecast Horizon",
+                            "status": "recalled",
+                            "evidence": "across our forecast horizon.",
+                            "explanation": "Contextualized smoothing across the forecast horizon.",
+                        },
+                        {
+                            "concept": "Mean Absolute Percentage Error",
+                            "status": "recalled",
+                            "evidence": "We evaluated accuracy using Mean Absolute Percentage Error and Root Mean Squared Error during holdout validation",
+                            "explanation": "Used MAPE to evaluate forecast accuracy.",
+                        },
+                        {
+                            "concept": "Root Mean Squared Error",
+                            "status": "recalled",
+                            "evidence": "We evaluated accuracy using Mean Absolute Percentage Error and Root Mean Squared Error during holdout validation",
+                            "explanation": "Used RMSE to evaluate forecast accuracy.",
+                        },
+                        {
+                            "concept": "Holdout Validation",
+                            "status": "recalled",
+                            "evidence": "during holdout validation",
+                            "explanation": "Evaluated error metrics on holdout validation.",
+                        },
+                        {
+                            "concept": "Prediction Intervals",
+                            "status": "recalled",
+                            "evidence": "while prediction intervals quantified uncertainty",
+                            "explanation": "Explained prediction intervals for uncertainty.",
+                        },
+                        {
+                            "concept": "Tracking Signal",
+                            "status": "recalled",
+                            "evidence": "tracking signals monitored forecast bias.",
+                            "explanation": "Explained tracking signals for bias monitoring.",
+                        },
+                    ],
+                    "feedback": "Clear synthesis of Triple Exponential Smoothing, error metrics, validation, and uncertainty intervals.",
+                })
+                + "\n```"
+            )
+
+    class E2EOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = type("Chat", (), {"completions": E2ECompletions()})()
+
+    monkeypatch.setattr(main, "nvidia_c4_assess", _REAL_NVIDIA_C4_ASSESS)
+    monkeypatch.setattr(main, "OpenAI", E2EOpenAI)
+
+    sub_resp = client.post(
+        f"/lessons/{lesson_id}/submissions",
+        headers=stu_headers,
+        json={"text": sample_tes_reflection},
+    )
+    assert sub_resp.status_code == 201, sub_resp.text
+    sub_id = sub_resp.json()["id"]
+
+    # Verify completed C4 assessment, evidence extraction, scoring band, and fallback model recording
+    fac_sub = client.get(f"/submissions/{sub_id}", headers=fac_headers).json()
+    assert fac_sub["assessment_status"] == "completed"
+    assert fac_sub["matched_concepts_count"] == 7
+    assert fac_sub["total_pool_concepts"] == 13
+    assert fac_sub["recall_percentage"] == 53.85
+    assert fac_sub["rating"] == 3  # Above 40-60% -> Rating 3
+    details = fac_sub["assessment_details"]
+    assert len(details["matched_concepts"]) == 7
+    assert len(details["unmatched_concepts"]) == 6
+    for mc in details["matched_concepts"]:
+        assert mc["evidence"] != ""
+        assert mc["evidence"] in sample_tes_reflection
+
+    c4_results = client.get(f"/lessons/{lesson_id}/c4-results", headers=fac_headers).json()
+    assert len(c4_results) == 1
+    assert c4_results[0]["model_name"] == "nvidia/nemotron-3.5-bolt-e4b"
+    assert c4_results[0]["c4_rating"] == 3
+
+    # Verify faculty review functionality remains intact
+    rev_resp = client.post(
+        f"/submissions/{sub_id}/review",
+        headers=fac_headers,
+        json={"action": "accept", "review_notes": "Verified TES end-to-end assessment."},
+    )
+    assert rev_resp.status_code == 200
+    assert rev_resp.json()["assessment_details"]["review_status"] == "accepted"

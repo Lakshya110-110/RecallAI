@@ -71,21 +71,24 @@ def sanitize_nemotron_json_text(raw_content: str | None) -> str:
     """
     Sanitize raw model output before JSON parsing:
     1. Strip optional <think>...</think> or <reasoning>...</reasoning> blocks.
-    2. Strip optional markdown ```json ... ``` or ``` ... ``` code fences.
-    3. Extract the outermost JSON object if surrounded by explanatory prose.
+    2. Reject unclosed <think> or <reasoning> blocks so unfinished reasoning is never parsed as JSON.
+    3. Strip optional markdown ```json ... ``` or ``` ... ``` code fences.
+    4. Extract the outermost JSON object if surrounded by explanatory prose.
     """
     if raw_content is None or not isinstance(raw_content, str) or not raw_content.strip():
         return ""
     cleaned = raw_content.strip()
     # Remove completed <think>...</think> or <reasoning>...</reasoning> blocks
     cleaned = re.sub(r"<(?:think|reasoning)>.*?</(?:think|reasoning)>", "", cleaned, flags=re.DOTALL | re.IGNORECASE).strip()
-    # If an unclosed <think> or <reasoning> tag precedes a code fence or JSON block, strip up to it
-    if re.match(r"^<(?:think|reasoning)>", cleaned, flags=re.IGNORECASE):
-        fence_idx = cleaned.find("```")
-        brace_idx = cleaned.find("{")
-        candidates = [idx for idx in (fence_idx, brace_idx) if idx != -1]
-        if candidates:
-            cleaned = cleaned[min(candidates) :].strip()
+    # If a closing </think> or </reasoning> tag is present without an opening tag (template-prefixed thinking), strip up to it
+    if re.search(r"</(?:think|reasoning)>", cleaned, flags=re.IGNORECASE):
+        cleaned = re.sub(r"^.*?</(?:think|reasoning)>", "", cleaned, flags=re.DOTALL | re.IGNORECASE).strip()
+    # If an unclosed <think> or <reasoning> tag remains, strip from the unclosed tag to the end (never parse unfinished thinking)
+    if re.search(r"<(?:think|reasoning)>", cleaned, flags=re.IGNORECASE):
+        cleaned = re.sub(r"<(?:think|reasoning)>.*$", "", cleaned, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    if not cleaned:
+        return ""
 
     # Strip markdown code fences if present (even when surrounded by explanatory text)
     fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", cleaned, flags=re.DOTALL | re.IGNORECASE)
@@ -102,6 +105,7 @@ def sanitize_nemotron_json_text(raw_content: str | None) -> str:
     # without truncating nested objects or accepting a malformed outer slice.
     decoder = json.JSONDecoder()
     first_valid_json: str | None = None
+    expected_top_keys = {"keywords", "concept_results", "recall_percentage"}
     for index, character in enumerate(cleaned):
         if character != "{":
             continue
@@ -110,7 +114,7 @@ def sanitize_nemotron_json_text(raw_content: str | None) -> str:
         except json.JSONDecodeError:
             continue
         candidate_slice = cleaned[index : index + end].strip()
-        if isinstance(obj, dict) and "keywords" in obj:
+        if isinstance(obj, dict) and any(k in obj for k in expected_top_keys):
             return candidate_slice
         if first_valid_json is None:
             first_valid_json = candidate_slice
@@ -188,10 +192,20 @@ def _safe_response_preview(value: object, limit: int = 500) -> str:
 
 
 def _inspect_response_diagnostics(response: object, raw_content: str | None) -> dict[str, Any]:
-    """Inspect response structure and raw content for safe diagnostic logging."""
+    """
+    Inspect response structure safely, including finish_reason, content, reasoning_content,
+    and token usage, without ever parsing reasoning_content as the final JSON response.
+    """
     finish_reason = None
     has_choices = False
     has_message = False
+    reasoning_text: str | None = None
+    usage_info: dict[str, int | None] = {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+        "reasoning_tokens": None,
+    }
     if response is not None:
         choices = getattr(response, "choices", None)
         if choices is None and isinstance(response, dict):
@@ -206,11 +220,39 @@ def _inspect_response_diagnostics(response: object, raw_content: str | None) -> 
             if msg is None and isinstance(first, dict):
                 msg = first.get("message")
             has_message = msg is not None
+            if msg is not None:
+                rc = getattr(msg, "reasoning_content", None)
+                if rc is None and isinstance(msg, dict):
+                    rc = msg.get("reasoning_content")
+                if isinstance(rc, str):
+                    reasoning_text = rc
+
+        usage_obj = getattr(response, "usage", None)
+        if usage_obj is None and isinstance(response, dict):
+            usage_obj = response.get("usage")
+        if usage_obj is not None:
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                val = getattr(usage_obj, key, None)
+                if val is None and isinstance(usage_obj, dict):
+                    val = usage_obj.get(key)
+                if isinstance(val, int):
+                    usage_info[key] = val
+            comp_details = getattr(usage_obj, "completion_tokens_details", None)
+            if comp_details is None and isinstance(usage_obj, dict):
+                comp_details = usage_obj.get("completion_tokens_details")
+            if comp_details is not None:
+                r_tok = getattr(comp_details, "reasoning_tokens", None)
+                if r_tok is None and isinstance(comp_details, dict):
+                    r_tok = comp_details.get("reasoning_tokens")
+                if isinstance(r_tok, int):
+                    usage_info["reasoning_tokens"] = r_tok
 
     is_none = raw_content is None
     is_empty = not bool(raw_content and str(raw_content).strip())
     has_fences = bool(raw_content and "```" in str(raw_content))
     is_truncated = finish_reason == "length"
+    has_reasoning = bool(reasoning_text and reasoning_text.strip())
+    reasoning_len = len(reasoning_text) if isinstance(reasoning_text, str) else 0
     return {
         "response_is_none": response is None,
         "has_choices": has_choices,
@@ -221,11 +263,18 @@ def _inspect_response_diagnostics(response: object, raw_content: str | None) -> 
         "content_is_empty": is_empty,
         "has_markdown_fences": has_fences,
         "content_length": len(raw_content) if isinstance(raw_content, str) else 0,
+        "has_reasoning_content": has_reasoning,
+        "reasoning_length": reasoning_len,
+        "reasoning_only": bool(is_empty and has_reasoning),
+        "usage": usage_info,
     }
 
 
 def _extract_assistant_content(response: object) -> str | None:
-    """Extract assistant message text from an OpenAI-compatible chat response."""
+    """
+    Extract assistant message content from an OpenAI-compatible chat response.
+    Never returns or parses reasoning_content as the final JSON response.
+    """
     if response is None:
         logger.warning("Nemotron response was None")
         return None
@@ -269,15 +318,12 @@ def _extract_assistant_content(response: object) -> str | None:
     if reasoning is None and isinstance(message, dict):
         reasoning = message.get("reasoning_content")
     if isinstance(reasoning, str) and reasoning.strip():
-        sanitized_reasoning = sanitize_nemotron_json_text(reasoning)
-        if sanitized_reasoning.startswith("{") and sanitized_reasoning.endswith("}"):
-            logger.warning(
-                "Nemotron assistant content was empty; extracted JSON from reasoning_content fallback preview=%s",
-                _safe_response_preview(reasoning),
-            )
-            return reasoning
         logger.warning(
-            "Nemotron assistant content was empty and reasoning_content contained no JSON object; preview=%s",
+            "Nemotron assistant content was empty while reasoning_content was present "
+            "(reasoning_length=%s, finish_reason=%s, reasoning_preview=%s); "
+            "refusing to parse reasoning_content as final JSON",
+            len(reasoning),
+            finish_reason,
             _safe_response_preview(reasoning),
         )
         return None
