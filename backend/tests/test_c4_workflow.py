@@ -10,9 +10,12 @@ from reportlab.pdfgen import canvas
 from app import document_processing, main
 from app.c4_scoring import (
     build_concept_pool,
+    calculate_c4_coverage,
     calculate_c4_rating,
+    canonicalize_concept,
     evaluate_c4_reflection,
     normalize_concept,
+    rating_for_c4_coverage,
 )
 
 client = TestClient(main.app)
@@ -79,14 +82,19 @@ def make_docx_bytes(text_content: str) -> bytes:
 @pytest.mark.parametrize(
     "matched_count, expected_rating",
     [
+        # 0–20% (0..3 of 15) -> 1
         (0, 1),
-        (4, 1),
-        (5, 2),
-        (7, 2),
-        (8, 3),
-        (10, 3),
-        (11, 4),
+        (3, 1),
+        # Above 20–40% (4..6 of 15) -> 2
+        (4, 2),
+        (6, 2),
+        # Above 40–60% (7..9 of 15) -> 3
+        (7, 3),
+        (9, 3),
+        # Above 60–80% (10..12 of 15) -> 4
+        (10, 4),
         (12, 4),
+        # Above 80–100% (13..15 of 15) -> 5
         (13, 5),
         (15, 5),
     ],
@@ -137,7 +145,8 @@ def test_c4_matching_deduplication_negation_and_word_boundaries():
     assert normalize_concept("Lag") not in matched_names
     assert normalize_concept("Confidence intervals") not in matched_names
     assert eval_res["matched_count"] == 2
-    assert eval_res["c4_rating"] == 1
+    assert eval_res["coverage_percentage"] == 40.0  # 2 / 5 canonical concepts = 40%
+    assert eval_res["c4_rating"] == 2  # Above 20–40% band = 2
 
 
 def test_ai_cannot_override_deterministic_c4_score_or_invent_pool_concepts():
@@ -1065,3 +1074,319 @@ def test_contributor_session_creation_and_direct_text_reference_reports(monkeypa
     contrib_analytics = client.get("/analytics/dashboard", headers=c1_headers)
     assert contrib_analytics.status_code == 200
     assert contrib_analytics.json()["total_sessions"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# 4. Redesigned C4 Canonical Normalization, Understanding-Aware Matching,
+#    Coverage Band Scoring, Empty Pool Safety, and Faculty Review Tests
+# ---------------------------------------------------------------------------
+
+def test_semantic_duplicates_merged_while_preserving_15_entries_and_attribution():
+    """
+    Verify:
+    - Exact duplicates and semantic duplicates (e.g. 'TES model' and 'Triple Exponential Smoothing',
+      'MAPE' and 'Mean Absolute Percentage Error', 'RMSE' and 'Root Mean Squared Error')
+      merge into single canonical concepts.
+    - All 15 original extracted entries and their contributor attributions are preserved.
+    - Original wording and merged entries are recorded on each canonical concept.
+    """
+    source_entries = [
+        # Contributor 1 (5 entries)
+        {"document_id": 101, "contributor_id": 11, "contributor_name": "Contributor Alpha", "position": 1, "raw_keyword": "TES model"},
+        {"document_id": 101, "contributor_id": 11, "contributor_name": "Contributor Alpha", "position": 2, "raw_keyword": "MAPE"},
+        {"document_id": 101, "contributor_id": 11, "contributor_name": "Contributor Alpha", "position": 3, "raw_keyword": "ACF"},
+        {"document_id": 101, "contributor_id": 11, "contributor_name": "Contributor Alpha", "position": 4, "raw_keyword": "Forecast horizon"},
+        {"document_id": 101, "contributor_id": 11, "contributor_name": "Contributor Alpha", "position": 5, "raw_keyword": "Seasonal index"},
+        # Contributor 2 (5 entries — 3 semantic duplicates of Contributor 1)
+        {"document_id": 102, "contributor_id": 12, "contributor_name": "Contributor Beta", "position": 1, "raw_keyword": "Triple Exponential Smoothing"},
+        {"document_id": 102, "contributor_id": 12, "contributor_name": "Contributor Beta", "position": 2, "raw_keyword": "Mean Absolute Percentage Error"},
+        {"document_id": 102, "contributor_id": 12, "contributor_name": "Contributor Beta", "position": 3, "raw_keyword": "Autocorrelation Function"},
+        {"document_id": 102, "contributor_id": 12, "contributor_name": "Contributor Beta", "position": 4, "raw_keyword": "RMSE"},
+        {"document_id": 102, "contributor_id": 12, "contributor_name": "Contributor Beta", "position": 5, "raw_keyword": "Tracking signal"},
+        # Contributor 3 (5 entries — 1 semantic duplicate of TES via Holt-Winters, 1 semantic duplicate of RMSE)
+        {"document_id": 103, "contributor_id": 13, "contributor_name": "Contributor Gamma", "position": 1, "raw_keyword": "Holt-Winters triple exponential smoothing"},
+        {"document_id": 103, "contributor_id": 13, "contributor_name": "Contributor Gamma", "position": 2, "raw_keyword": "Root Mean Squared Error"},
+        {"document_id": 103, "contributor_id": 13, "contributor_name": "Contributor Gamma", "position": 3, "raw_keyword": "Partial Autocorrelation Function"},
+        {"document_id": 103, "contributor_id": 13, "contributor_name": "Contributor Gamma", "position": 4, "raw_keyword": "Holdout validation"},
+        {"document_id": 103, "contributor_id": 13, "contributor_name": "Contributor Gamma", "position": 5, "raw_keyword": "Prediction intervals"},
+    ]
+
+    pool = build_concept_pool(source_entries)
+
+    # All 15 original entries are preserved with contributor attribution
+    assert pool["total_raw_keywords"] == 15
+    assert len(pool["source_entries"]) == 15
+    assert pool["source_entries"][0]["raw_keyword"] == "TES model"
+    assert pool["source_entries"][0]["contributor_name"] == "Contributor Alpha"
+    assert pool["source_entries"][5]["raw_keyword"] == "Triple Exponential Smoothing"
+    assert pool["source_entries"][5]["contributor_name"] == "Contributor Beta"
+
+    # 15 entries merged into 10 unique canonical concepts (5 duplicate entries merged)
+    assert pool["distinct_concepts_count"] == 10
+    assert pool["canonical_concepts_count"] == 10
+    assert pool["merged_entries_count"] == 5
+    assert pool["has_duplicates"] is True
+    assert len(pool["duplicate_concepts"]) == 4
+
+    # Verify 'TES model', 'Triple Exponential Smoothing', and 'Holt-Winters triple exponential smoothing'
+    # merged into ONE canonical concept 'Triple Exponential Smoothing' with all 3 original terms preserved
+    tes_concept = next(
+        c for c in pool["distinct_concepts"] if c["canonical_concept"] == "Triple Exponential Smoothing"
+    )
+    assert tes_concept["occurrence_count"] == 3
+    assert tes_concept["is_merged"] is True
+    assert set(tes_concept["original_terms"]) == {
+        "TES model",
+        "Triple Exponential Smoothing",
+        "Holt-Winters triple exponential smoothing",
+    }
+    assert set(tes_concept["source_contributor_names"]) == {
+        "Contributor Alpha",
+        "Contributor Beta",
+        "Contributor Gamma",
+    }
+    assert len(tes_concept["merged_entries"]) == 3
+
+
+def test_genuine_distinct_concepts_are_not_merged():
+    """
+    Verify genuinely different Business Forecasting concepts are NEVER merged:
+    - Simple Exponential Smoothing vs Double Exponential Smoothing vs Triple Exponential Smoothing
+    - ACF vs PACF
+    - MAPE vs RMSE vs MAE vs MAD
+    - Moving Average vs Weighted Moving Average
+    - Confidence Intervals vs Prediction Intervals
+    """
+    distinct_entries = [
+        {"document_id": 1, "contributor_id": 1, "position": 1, "raw_keyword": "Simple Exponential Smoothing"},
+        {"document_id": 1, "contributor_id": 1, "position": 2, "raw_keyword": "Double Exponential Smoothing"},
+        {"document_id": 1, "contributor_id": 1, "position": 3, "raw_keyword": "Triple Exponential Smoothing"},
+        {"document_id": 1, "contributor_id": 1, "position": 4, "raw_keyword": "Autocorrelation Function"},
+        {"document_id": 1, "contributor_id": 1, "position": 5, "raw_keyword": "Partial Autocorrelation Function"},
+        {"document_id": 2, "contributor_id": 2, "position": 1, "raw_keyword": "Mean Absolute Percentage Error"},
+        {"document_id": 2, "contributor_id": 2, "position": 2, "raw_keyword": "Root Mean Squared Error"},
+        {"document_id": 2, "contributor_id": 2, "position": 3, "raw_keyword": "Mean Absolute Error"},
+        {"document_id": 2, "contributor_id": 2, "position": 4, "raw_keyword": "Mean Absolute Deviation"},
+        {"document_id": 2, "contributor_id": 2, "position": 5, "raw_keyword": "Mean Squared Error"},
+        {"document_id": 3, "contributor_id": 3, "position": 1, "raw_keyword": "Moving Average"},
+        {"document_id": 3, "contributor_id": 3, "position": 2, "raw_keyword": "Weighted Moving Average"},
+        {"document_id": 3, "contributor_id": 3, "position": 3, "raw_keyword": "Confidence Intervals"},
+        {"document_id": 3, "contributor_id": 3, "position": 4, "raw_keyword": "Prediction Intervals"},
+        {"document_id": 3, "contributor_id": 3, "position": 5, "raw_keyword": "Tracking Signal"},
+    ]
+    pool = build_concept_pool(distinct_entries)
+    assert pool["total_raw_keywords"] == 15
+    assert pool["distinct_concepts_count"] == 15
+    assert pool["has_duplicates"] is False
+    assert len(pool["duplicate_concepts"]) == 0
+
+
+def test_student_assessment_accepts_explanations_and_equivalent_terms_and_rejects_bare_keyword_lists():
+    """
+    Verify Requirement 3:
+    - Compare student's reflection with every canonical concept.
+    - Award max 1 mark per canonical concept (even when repeated or mentioned via multiple aliases).
+    - Accept correct explanations and equivalent terminology.
+    - Do NOT award marks for merely listing a keyword without demonstrating understanding.
+    - Store the supporting evidence phrase from the student's reflection.
+    - Display matched and unmatched concepts separately.
+    """
+    source_entries = [
+        {"document_id": 1, "contributor_id": 1, "position": 1, "raw_keyword": "TES model"},
+        {"document_id": 2, "contributor_id": 2, "position": 1, "raw_keyword": "Triple Exponential Smoothing"},
+        {"document_id": 1, "contributor_id": 1, "position": 2, "raw_keyword": "MAPE"},
+        {"document_id": 1, "contributor_id": 1, "position": 3, "raw_keyword": "RMSE"},
+        {"document_id": 1, "contributor_id": 1, "position": 4, "raw_keyword": "Autocorrelation Function"},
+        {"document_id": 1, "contributor_id": 1, "position": 5, "raw_keyword": "Tracking Signal"},
+    ]
+    pool = build_concept_pool(source_entries)
+    # 6 raw entries -> 5 canonical concepts (TES model + Triple Exponential Smoothing merged)
+    assert pool["distinct_concepts_count"] == 5
+
+    # Case A: Bare keyword listing without demonstrating understanding -> 0 marks, Rating 1
+    bare_list_reflection = "Keywords: TES model, Triple Exponential Smoothing, MAPE, RMSE, Autocorrelation Function, Tracking Signal."
+    bare_eval = evaluate_c4_reflection(bare_list_reflection, pool)
+    assert bare_eval["matched_count"] == 0
+    assert bare_eval["coverage_percentage"] == 0.0
+    assert bare_eval["c4_rating"] == 1
+    assert len(bare_eval["matched_concepts"]) == 0
+    assert len(bare_eval["unmatched_concepts"]) == 5
+
+    # Case B: Trivial meta-naming ("I learned about X, Y, Z today") without explanation -> 0 marks
+    meta_only_reflection = "I learned about TES model, MAPE, RMSE, and Tracking Signal in class today."
+    meta_eval = evaluate_c4_reflection(meta_only_reflection, pool)
+    assert meta_eval["matched_count"] == 0
+    assert meta_eval["c4_rating"] == 1
+
+    # Case C: Meaningful reflection using repeated synonyms for TES + equivalent explanation for MAPE + ACF
+    understanding_reflection = (
+        "We applied the TES model because Triple Exponential Smoothing and Holt-Winters smooth level, trend, "
+        "and seasonal fluctuations simultaneously. "
+        "We evaluated forecast accuracy using the average of the absolute percentage forecast errors across quarters. "
+        "Finally, the autocorrelation function helped us inspect correlation across lagged observations."
+    )
+    good_eval = evaluate_c4_reflection(understanding_reflection, pool)
+
+    # Matched canonical concepts:
+    # 1. Triple Exponential Smoothing (mentioned via 'TES model', 'Triple Exponential Smoothing', 'Holt-Winters' -> awarded max 1 mark!)
+    # 2. Mean Absolute Percentage Error (matched via conceptual explanation 'average of the absolute percentage forecast errors')
+    # 3. Autocorrelation Function (matched with contextual explanation)
+    # Unmatched: Root Mean Squared Error, Tracking Signal
+    assert good_eval["matched_count"] == 3
+    assert good_eval["total_canonical_concepts"] == 5
+    assert good_eval["coverage_percentage"] == 60.0  # (3 / 5) * 100 = 60.0%
+    assert good_eval["c4_rating"] == 3  # Above 40–60% = 3
+    assert len(good_eval["matched_concepts"]) == 3
+    assert len(good_eval["unmatched_concepts"]) == 2
+
+    # Every matched concept has a non-empty supporting evidence phrase from the student reflection
+    for mc in good_eval["matched_concepts"]:
+        assert mc["marks_awarded"] == 1
+        assert mc["max_marks"] == 1
+        assert mc["evidence"] != ""
+        assert mc["evidence"] in understanding_reflection
+
+
+def test_empty_concept_pool_handled_safely():
+    """Verify Requirement 4 & 6: Empty pool (0 canonical concepts) never divides by zero."""
+    empty_pool = build_concept_pool([])
+    assert empty_pool["total_raw_keywords"] == 0
+    assert empty_pool["distinct_concepts_count"] == 0
+
+    res = evaluate_c4_reflection("Student reflection discussing forecasting methods.", empty_pool)
+    assert res["total_distinct_concepts"] == 0
+    assert res["matched_count"] == 0
+    assert res["coverage_percentage"] == 0.0
+    assert res["recall_percentage"] == 0.0
+    assert res["c4_rating"] == 1
+
+
+def test_end_to_end_semantic_pool_review_and_submission_faculty_review(monkeypatch):
+    """
+    Verify end-to-end:
+    - 3 contributors submit reports with semantic duplicate keywords ('TES model' + 'Triple Exponential Smoothing').
+    - Faculty dashboard endpoint returns all 15 original entries, normalized canonical concepts,
+      duplicate/merged entries, and contributor attribution.
+    - Faculty can review and approve the normalized concept pool.
+    - Student submits reflection; C4 assessment computes coverage percentage and rating band,
+      stores evidence phrases, and allows faculty review/acceptance before final acceptance.
+    - Student view never exposes the reference keyword pool or unmatched concepts.
+    """
+    faculty = login_faculty()
+    s1_id, s1_headers, _ = register_and_login_student("Aarav Contributor")
+    s2_id, s2_headers, _ = register_and_login_student("Diya Contributor")
+    s3_id, s3_headers, _ = register_and_login_student("Kabir Contributor")
+    stu_id, stu_headers, _ = register_and_login_student("Meera Learner")
+
+    created = client.post(
+        "/lessons",
+        headers=faculty,
+        json={
+            "title": "Normalized C4 Assessment & Faculty Review Session",
+            "subject": "Business Forecasting",
+            "assessment_mode": "c4",
+            "contributor_ids": [s1_id, s2_id, s3_id],
+        },
+    )
+    assert created.status_code == 200
+    lesson_id = created.json()["id"]
+
+    # Contributor 1 & 2 share semantic duplicates ('TES model' / 'Triple Exponential Smoothing', 'MAPE' / 'Mean Absolute Percentage Error')
+    kws_by_contrib = {
+        1: ["TES model", "MAPE", "Seasonal Index", "Forecast Horizon", "Holdout Validation"],
+        2: ["Triple Exponential Smoothing", "Mean Absolute Percentage Error", "Autocorrelation Function", "Tracking Signal", "Prediction Intervals"],
+        3: ["Root Mean Squared Error", "Partial Autocorrelation Function", "Seasonal ARIMA", "Demand Elasticity", "Residual Diagnostics"],
+    }
+
+    for idx, hdrs in enumerate([s1_headers, s2_headers, s3_headers], start=1):
+        monkeypatch.setattr(
+            document_processing,
+            "call_nemotron_keyword_extraction",
+            lambda document_text, subject="Business Forecasting", i=idx: json.dumps({"keywords": kws_by_contrib[i]}),
+        )
+        up = client.post(
+            f"/lessons/{lesson_id}/reference-reports",
+            headers=hdrs,
+            json={
+                "title": f"Contributor {idx} Forecasting Report",
+                "content": f"Detailed forecasting reference report {idx} discussing exponential smoothing, error metrics, and validation.",
+            },
+        )
+        assert up.status_code == 201
+
+    # Faculty inspects normalized concept pool
+    pool_res = client.get(f"/lessons/{lesson_id}/keyword-pool", headers=faculty)
+    assert pool_res.status_code == 200
+    pool_json = pool_res.json()
+    assert pool_json["total_raw_keywords"] == 15
+    assert len(pool_json["source_entries"]) == 15
+    assert pool_json["distinct_concepts_count"] == 13  # 2 semantic duplicate pairs merged (15 - 2 = 13)
+    assert pool_json["merged_entries_count"] == 2
+    assert len(pool_json["duplicate_concepts"]) == 2
+    assert pool_json["review_status"] == "pending_review"
+
+    # Faculty reviews and approves the normalized concept pool
+    pool_review_res = client.post(
+        f"/lessons/{lesson_id}/keyword-pool/review",
+        headers=faculty,
+        json={"action": "approve", "review_notes": "Verified TES and MAPE canonical merges."},
+    )
+    assert pool_review_res.status_code == 200
+    assert pool_review_res.json()["review_status"] == "approved"
+    assert pool_review_res.json()["review_notes"] == "Verified TES and MAPE canonical merges."
+
+    # Mock AI C4 call to return empty list so deterministic understanding & evidence extraction is tested directly
+    monkeypatch.setattr(
+        main,
+        "nvidia_c4_assess",
+        lambda lesson, submission, pool_data: main.NvidiaC4MatchResponse(
+            concept_results=[],
+            feedback="Evaluated reflection against canonical concept pool.",
+        ),
+    )
+
+    reflection_text = (
+        "We used the TES model to smooth level, trend, and seasonal components over our forecast horizon. "
+        "Mean Absolute Percentage Error and Root Mean Squared Error quantified accuracy during holdout validation, "
+        "while tracking signals monitored bias and prediction intervals bounded future demand."
+    )
+    sub_res = client.post(
+        f"/lessons/{lesson_id}/submissions",
+        headers=stu_headers,
+        json={"text": reflection_text},
+    )
+    assert sub_res.status_code == 201
+    sub_id = sub_res.json()["id"]
+
+    # Faculty inspects submission details
+    fac_sub = client.get(f"/submissions/{sub_id}", headers=faculty).json()
+    details = fac_sub["assessment_details"]
+    assert details["total_raw_keywords"] == 15
+    assert details["total_canonical_concepts"] == 13
+    assert details["matched_count"] == 7
+    # Coverage = (7 / 13) * 100 = 53.85% -> Above 40–60% = Rating 3
+    assert details["coverage_percentage"] == 53.85
+    assert fac_sub["rating"] == 3
+    assert details["review_status"] == "pending_review"
+    assert len(details["matched_concepts"]) == 7
+    assert len(details["unmatched_concepts"]) == 6
+    for m in details["matched_concepts"]:
+        assert m["evidence"] in reflection_text
+
+    # Faculty reviews and accepts the student's assessment result
+    accept_res = client.post(
+        f"/submissions/{sub_id}/review",
+        headers=faculty,
+        json={"action": "accept", "review_notes": "Confirmed 7/13 canonical concepts and supporting evidence."},
+    )
+    assert accept_res.status_code == 200
+    assert accept_res.json()["assessment_details"]["review_status"] == "accepted"
+
+    # Student views own submission: never sees reference pool or unmatched concepts
+    stu_view = client.get(f"/submissions/{sub_id}", headers=stu_headers).json()
+    assert stu_view["rating"] == 3
+    assert stu_view["recall_percentage"] == 53.85
+    assert "unmatched_concepts" not in stu_view["assessment_details"]
+    assert "matched_concepts" not in stu_view["assessment_details"]
+    assert "missing_concepts" not in stu_view["assessment_details"]
+

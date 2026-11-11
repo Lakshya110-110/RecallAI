@@ -1,18 +1,23 @@
 from decimal import Decimal
 
-from .c4_scoring import calculate_c4_rating
+from .c4_scoring import (
+    calculate_c4_coverage,
+    calculate_c4_rating,
+    rating_for_c4_coverage,
+)
 
 
-def rating_for_c4_concepts(matched_count: int) -> int:
+def rating_for_c4_concepts(matched_count: int, total_concepts: int = 15) -> int:
     """
-    Deterministic C4 rating (1-5) for 0-15 matched concepts:
-      0-4   -> 1
-      5-7   -> 2
-      8-10  -> 3
-      11-12 -> 4
-      13-15 -> 5
+    Deterministic C4 rating (1-5) based on coverage percentage:
+      Coverage = (Matched canonical concepts / Total canonical concepts) * 100
+      0–20%         -> 1
+      Above 20–40%  -> 2
+      Above 40–60%  -> 3
+      Above 60–80%  -> 4
+      Above 80–100% -> 5
     """
-    return calculate_c4_rating(matched_count)
+    return calculate_c4_rating(matched_count, total_concepts=total_concepts)
 
 
 def rating_for_recall(percentage: float) -> int:
@@ -31,3 +36,12 @@ def rating_for_recall(percentage: float) -> int:
     if value >= 80:
         return 3
     return 0
+
+
+__all__ = [
+    "calculate_c4_coverage",
+    "calculate_c4_rating",
+    "rating_for_c4_concepts",
+    "rating_for_c4_coverage",
+    "rating_for_recall",
+]
