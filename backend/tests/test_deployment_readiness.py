@@ -210,6 +210,352 @@ def test_reversible_migration_and_restart_persistence():
         finally:
             restarted_engine.dispose()
 
-    # Verify original recallai.db was untouched
+        # Verify original recallai.db was untouched
     assert orig_db.stat().st_mtime_ns == orig_mtime
     assert orig_db.stat().st_size == orig_size
+
+
+def test_keyword_extraction_empty_model_response(monkeypatch):
+    """Test empty string, whitespace-only, and empty code fence model responses."""
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    for empty_val in ["", "   \n\t  ", "```json\n\n```", "<think>thinking only</think>"]:
+        with pytest.raises(ValueError, match="Empty response"):
+            _parse_and_validate_five_keywords(empty_val)
+
+    monkeypatch.setattr(
+        document_processing,
+        "call_nemotron_keyword_extraction",
+        lambda document_text, subject="Business Forecasting": "   ",
+    )
+    with pytest.raises(KeywordExtractionError, match="Empty response"):
+        document_processing.extract_five_keywords_with_retries("Valid forecasting report text for extraction.", max_attempts=3)
+
+
+def test_keyword_extraction_none_response(monkeypatch):
+    """Test None response object, None message content, and corrupted non-JSON reasoning_content."""
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    assert document_processing._extract_assistant_content(None) is None
+    assert document_processing._extract_assistant_content(type("Resp", (), {"choices": []})()) is None
+
+    # Message with content=None and reasoning_content=None
+    msg_none = type("Msg", (), {"content": None, "reasoning_content": None})()
+    choice_none = type("Choice", (), {"message": msg_none, "finish_reason": "stop"})()
+    resp_none = type("Resp", (), {"choices": [choice_none]})()
+    assert document_processing._extract_assistant_content(resp_none) is None
+
+    # Message with content=None and corrupted non-JSON reasoning_content (e.g. "\ufffd\ufffd{U.")
+    msg_corrupt = type("Msg", (), {"content": None, "reasoning_content": "\ufffd\ufffd{U."})()
+    choice_corrupt = type("Choice", (), {"message": msg_corrupt, "finish_reason": "stop"})()
+    resp_corrupt = type("Resp", (), {"choices": [choice_corrupt]})()
+    assert document_processing._extract_assistant_content(resp_corrupt) is None
+
+    with pytest.raises(ValueError, match="Empty response"):
+        _parse_and_validate_five_keywords(None)  # type: ignore[arg-type]
+
+
+def test_keyword_extraction_malformed_json(monkeypatch):
+    """Test malformed, truncated, or non-object JSON responses."""
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    for bad_json in [
+        '{"keywords": ["Moving average", "Seasonal index"',
+        "{keywords: [1, 2, 3, 4, 5]}",
+        "Not JSON at all, just plain text without braces",
+        "```json\n{\"keywords\": [\"only_unclosed\"\n```",
+    ]:
+        with pytest.raises(ValueError, match="Malformed JSON from model"):
+            _parse_and_validate_five_keywords(bad_json)
+
+    with pytest.raises(ValueError, match="top-level 'keywords' array"):
+        _parse_and_validate_five_keywords('{"concepts": ["a", "b", "c", "d", "e"]}')
+
+
+def test_keyword_extraction_json_inside_markdown_code_fences():
+    """Test valid JSON returned inside ```json ... ``` or ``` ... ``` fences and surrounded by prose."""
+    fenced_with_prose = (
+        "Here are the 5 distinct forecasting concepts extracted from your report:\n\n"
+        "```json\n"
+        "{\n"
+        '  "keywords": [\n'
+        '    "Holt-Winters exponential smoothing",\n'
+        '    "Seasonal index decomposition",\n'
+        '    "Mean Absolute Percentage Error",\n'
+        '    "Autoregressive integrated moving average",\n'
+        '    "Tracking signal bias"\n'
+        "  ]\n"
+        "}\n"
+        "```\n"
+        "Let me know if you need additional analysis."
+    )
+    validated = _parse_and_validate_five_keywords(fenced_with_prose)
+    assert len(validated) == 5
+    assert [item["position"] for item in validated] == [1, 2, 3, 4, 5]
+    assert validated[0]["raw_keyword"] == "Holt-Winters exponential smoothing"
+    assert validated[4]["raw_keyword"] == "Tracking signal bias"
+
+
+def test_keyword_extraction_valid_json_with_duplicate_keywords_rejected():
+    """Test that valid JSON containing duplicate or inflectionally identical keywords is rejected."""
+    dup_json = json.dumps({
+        "keywords": [
+            "Exponential smoothing",
+            "Moving average",
+            "Moving averages",  # duplicate after normalization
+            "Seasonal decomposition",
+            "Tracking signal",
+        ]
+    })
+    with pytest.raises(ValueError, match="Validation requires exactly 5 distinct meaningful keywords"):
+        _parse_and_validate_five_keywords(dup_json)
+
+    # Also verify generic single-word filler is rejected
+    generic_json = json.dumps({
+        "keywords": [
+            "forecasting",  # generic single word
+            "Moving average",
+            "Exponential smoothing",
+            "Seasonal decomposition",
+            "Tracking signal",
+        ]
+    })
+    with pytest.raises(ValueError, match="Validation requires exactly 5 distinct meaningful keywords"):
+        _parse_and_validate_five_keywords(generic_json)
+
+
+def test_keyword_extraction_valid_five_keyword_response(monkeypatch):
+    """Test valid five-keyword response and verify NVIDIA request parameters do not set response_format json_object."""
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-secret-key-do-not-log")
+    monkeypatch.setenv("NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    captured_kwargs: dict = {}
+
+    class FakeChoice:
+        def __init__(self, content: str):
+            self.finish_reason = "stop"
+            self.message = type("Msg", (), {"content": content, "reasoning_content": None})()
+
+    class FakeResponse:
+        def __init__(self, content: str):
+            self.choices = [FakeChoice(content)]
+
+    class FakeChatCompletions:
+        def create(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return FakeResponse(
+                json.dumps({
+                    "keywords": [
+                        "Triple exponential smoothing",
+                        "Seasonal decomposition",
+                        "Mean absolute percentage error",
+                        "Rolling holdout validation",
+                        "Tracking signal monitoring",
+                    ]
+                })
+            )
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = type("Chat", (), {"completions": FakeChatCompletions()})()
+
+    monkeypatch.setattr(document_processing, "call_nemotron_keyword_extraction", _REAL_CALL_NEMOTRON_EXTRACTION)
+    monkeypatch.setattr(document_processing, "OpenAI", FakeOpenAI)
+
+    result = document_processing.extract_five_keywords_with_retries(
+        "Reference report on triple exponential smoothing, seasonal decomposition, MAPE, rolling holdout validation, and tracking signals."
+    )
+    assert len(result) == 5
+    assert [r["raw_keyword"] for r in result] == [
+        "Triple exponential smoothing",
+        "Seasonal decomposition",
+        "Mean absolute percentage error",
+        "Rolling holdout validation",
+        "Tracking signal monitoring",
+    ]
+    assert "response_format" not in captured_kwargs
+    assert captured_kwargs.get("max_tokens") == 512
+    assert captured_kwargs.get("extra_body") == {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+def test_nvidia_api_timeout_and_temporary_failure_exhaustion_and_recovery(monkeypatch):
+    """Test recovery across API timeout + malformed JSON + valid response, and clean failure when all attempts fail."""
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-super-secret-token")
+    monkeypatch.setenv("NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
+    monkeypatch.setenv("NVIDIA_MAX_RETRIES", "2")
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    call_seq = {"n": 0}
+
+    class FakeChoice:
+        def __init__(self, content: str | None):
+            self.finish_reason = "stop"
+            self.message = type("Msg", (), {"content": content, "reasoning_content": None})()
+
+    class FakeResponse:
+        def __init__(self, content: str | None):
+            self.choices = [FakeChoice(content)]
+
+    class FakeChatCompletions:
+        def create(self, **kwargs):
+            call_seq["n"] += 1
+            if call_seq["n"] == 1:
+                raise TimeoutError("Request timed out talking to integrate.api.nvidia.com with key nvapi-super-secret-token")
+            if call_seq["n"] == 2:
+                return FakeResponse('{"keywords": ["truncated_json"')
+            return FakeResponse(
+                json.dumps({
+                    "keywords": [
+                        "Autoregressive moving average",
+                        "Stationarity differencing",
+                        "Ljung-Box Q statistic",
+                        "Partial autocorrelation",
+                        "Akaike information criterion",
+                    ]
+                })
+            )
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = type("Chat", (), {"completions": FakeChatCompletions()})()
+
+    monkeypatch.setattr(document_processing, "call_nemotron_keyword_extraction", _REAL_CALL_NEMOTRON_EXTRACTION)
+    monkeypatch.setattr(document_processing, "OpenAI", FakeOpenAI)
+
+    recovered = document_processing.extract_five_keywords_with_retries(
+        "ARIMA reference report text with stationarity, Ljung-Box, PACF, and AIC.",
+        max_attempts=3,
+    )
+    assert len(recovered) == 5
+    assert call_seq["n"] == 3
+
+    # Now verify bounded exhaustion when API always times out, and ensure secret key is redacted
+    class AlwaysTimeoutCompletions:
+        def create(self, **kwargs):
+            raise TimeoutError("Timeout with nvapi-super-secret-token")
+
+    class AlwaysTimeoutOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = type("Chat", (), {"completions": AlwaysTimeoutCompletions()})()
+
+    monkeypatch.setattr(document_processing, "OpenAI", AlwaysTimeoutOpenAI)
+    with pytest.raises(KeywordExtractionError) as exc_info:
+        document_processing.extract_five_keywords_with_retries("Report text", max_attempts=2)
+    assert "nvapi-super-secret-token" not in str(exc_info.value)
+    assert "nvapi-[REDACTED]" in str(exc_info.value)
+
+
+def test_retry_processing_does_not_duplicate_reports_or_keywords(monkeypatch):
+    """
+    Verify Requirement 9 & 10:
+    - Contributor submits a reference report; when extraction fails, report is stored with status 'failed'.
+    - Retrying via /reference-documents/me/retry or resubmitting the identical report re-runs extraction
+      on the existing document without creating duplicate ReferenceDocument rows or duplicate ExtractedKeyword rows.
+    - Session readiness transitions to 'ready_for_assessment' only after all 3 contributors complete extraction.
+    """
+    monkeypatch.setenv("FACULTY_SIGNUP_CODE", "011002")
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    def reg_user(name: str, role: str):
+        email = f"nodup-{uuid.uuid4().hex[:8]}@rvu.edu.in"
+        pw = "password-12345"
+        r = client.post(
+            "/auth/register",
+            json={
+                "name": name,
+                "email": email,
+                "password": pw,
+                "confirm_password": pw,
+                "role": role,
+                "signup_code": "011002" if role in {"faculty", "contributor"} else None,
+            },
+        )
+        assert r.status_code == 201
+        tok = client.post("/auth/login", json={"email": email, "password": pw, "expected_role": role}).json()["token"]
+        return r.json()["user"]["id"], {"Authorization": f"Bearer {tok}"}
+
+    _, fac_headers = reg_user("Faculty NoDup", "faculty")
+    c1_id, c1_headers = reg_user("Contrib NoDup 1", "contributor")
+    c2_id, c2_headers = reg_user("Contrib NoDup 2", "contributor")
+    c3_id, c3_headers = reg_user("Contrib NoDup 3", "contributor")
+
+    lesson_id = client.post(
+        "/lessons",
+        headers=fac_headers,
+        json={
+            "title": "No Duplicate Retry Session",
+            "subject": "Business Forecasting",
+            "assessment_mode": "c4",
+            "contributor_ids": [c1_id, c2_id, c3_id],
+        },
+    ).json()["id"]
+
+    # Step 1: Contributor 1 submits report while Nemotron returns malformed JSON
+    monkeypatch.setattr(
+        document_processing,
+        "call_nemotron_keyword_extraction",
+        lambda document_text, subject="Business Forecasting": '{"keywords": ["broken"',
+    )
+    rep1_body = (
+        "Contributor 1 report covering Holt-Winters smoothing, seasonal indices, "
+        "forecast horizon, tracking signals, and MAPE diagnostics."
+    )
+    sub1 = client.post(
+        f"/lessons/{lesson_id}/reference-reports",
+        headers=c1_headers,
+        json={"title": "C1 Report", "content": rep1_body},
+    )
+    assert sub1.status_code == 201
+    assert sub1.json()["processing_status"] == "failed"
+    doc1_id = sub1.json()["id"]
+
+    # Step 2: Nemotron recovers; Contributor 1 clicks Retry Processing (/reference-documents/me/retry)
+    monkeypatch.setattr(
+        document_processing,
+        "call_nemotron_keyword_extraction",
+        lambda document_text, subject="Business Forecasting": json.dumps({
+            "keywords": [
+                "Holt-Winters smoothing",
+                "Seasonal indices",
+                "Forecast horizon",
+                "Tracking signals",
+                "MAPE diagnostics",
+            ]
+        }),
+    )
+    retry1 = client.post(f"/lessons/{lesson_id}/reference-documents/me/retry", headers=c1_headers)
+    assert retry1.status_code == 200
+    assert retry1.json()["id"] == doc1_id
+    assert retry1.json()["processing_status"] == "completed"
+
+    # Calling retry again or re-submitting identical report text must NOT create duplicate reports or keywords
+    retry1_again = client.post(f"/lessons/{lesson_id}/reference-documents/me/retry", headers=c1_headers)
+    assert retry1_again.status_code == 200
+    assert retry1_again.json()["id"] == doc1_id
+
+    resub1 = client.post(
+        f"/lessons/{lesson_id}/reference-reports",
+        headers=c1_headers,
+        json={"title": "C1 Report", "content": rep1_body},
+    )
+    assert resub1.status_code == 201
+    assert resub1.json()["id"] == doc1_id
+
+    # Verify in database: exactly 1 ReferenceDocument and 5 ExtractedKeyword rows for Contributor 1 in this lesson
+    with main.SessionLocal() as db_session:
+        c1_docs = db_session.scalars(
+            select(main.ReferenceDocument).where(
+                main.ReferenceDocument.lesson_id == lesson_id,
+                main.ReferenceDocument.contributor_id == c1_id,
+            )
+        ).all()
+        assert len(c1_docs) == 1
+        c1_kws = db_session.scalars(
+            select(main.ExtractedKeyword).where(
+                main.ExtractedKeyword.lesson_id == lesson_id,
+                main.ExtractedKeyword.contributor_id == c1_id,
+            )
+        ).all()
+        assert len(c1_kws) == 5
+

@@ -60,8 +60,10 @@ from .similarity import compare_text
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT_DIR = Path(__file__).resolve().parents[2]
+BACKEND_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(BASE_DIR / ".env")
 load_dotenv(PROJECT_ROOT_DIR / ".env")
+load_dotenv(BACKEND_DIR / ".env")
 
 
 def normalize_database_url(raw_url: str | None) -> str:
@@ -121,11 +123,13 @@ def get_cors_origins() -> list[str]:
     """
     Build CORS allow_origins list from CORS_ORIGINS (and optional FRONTEND_URL),
     always preserving http://localhost:5173 and http://127.0.0.1:5173 for local development.
+    Also supports LAN IP addresses from LAN_FRONTEND_URL environment variable.
     """
     origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
     raw = os.getenv("CORS_ORIGINS", "")
     frontend_url = os.getenv("FRONTEND_URL", "")
-    for item in (*raw.split(","), frontend_url):
+    lan_frontend_url = os.getenv("LAN_FRONTEND_URL", "")
+    for item in (*raw.split(","), frontend_url, lan_frontend_url):
         cleaned = item.strip().rstrip("/")
         if cleaned and cleaned not in origins:
             origins.append(cleaned)
@@ -1371,8 +1375,13 @@ def process_reference_document_extraction(session: Session, doc: ReferenceDocume
 
     try:
         keywords = extract_five_keywords_with_retries(doc.extracted_text, subject=SUPPORTED_SUBJECT)
-        # Clear any partial keywords from prior attempts
-        session.query(ExtractedKeyword).filter(ExtractedKeyword.document_id == doc.id).delete()
+        # Clear any partial or prior keywords for this document or contributor in this lesson
+        session.query(ExtractedKeyword).filter(
+            or_(
+                ExtractedKeyword.document_id == doc.id,
+                (ExtractedKeyword.lesson_id == lesson.id) & (ExtractedKeyword.contributor_id == doc.contributor_id),
+            )
+        ).delete(synchronize_session=False)
         for kw in keywords:
             session.add(
                 ExtractedKeyword(
@@ -2057,7 +2066,7 @@ async def upload_reference_document(
             raise HTTPException(415, msg)
         raise HTTPException(400, msg)
 
-    # Check if identical active document is already completed (idempotent re-upload protection)
+    # Check if identical active document already exists (idempotent re-upload & retry protection)
     existing_active = session.scalar(
         select(ReferenceDocument).where(
             ReferenceDocument.lesson_id == lesson_id,
@@ -2065,13 +2074,16 @@ async def upload_reference_document(
             ReferenceDocument.is_active == 1,
         )
     )
-    if (
-        existing_active
-        and existing_active.sha256_hash == sha256_hex
-        and existing_active.processing_status == "completed"
-    ):
-        recompute_lesson_readiness_and_pool(session, lesson)
+    if existing_active and existing_active.sha256_hash == sha256_hex:
+        if existing_active.processing_status == "completed":
+            recompute_lesson_readiness_and_pool(session, lesson)
+            session.commit()
+            return _serialize_contributor_document(existing_active)
+        existing_active.report_title = safe_display_name
+        existing_active.original_filename = safe_display_name
         session.commit()
+        process_reference_document_extraction(session, existing_active, lesson)
+        session.refresh(existing_active)
         return _serialize_contributor_document(existing_active)
 
     next_version = 1
@@ -2169,16 +2181,17 @@ def _submit_direct_reference_report_impl(
             ReferenceDocument.is_active == 1,
         )
     )
-    if (
-        existing_active
-        and existing_active.sha256_hash == sha256_hex
-        and existing_active.processing_status == "completed"
-    ):
+    if existing_active and existing_active.sha256_hash == sha256_hex:
         if existing_active.report_title != safe_title:
             existing_active.report_title = safe_title
             existing_active.original_filename = f"{safe_title} (Written Report)"
-        recompute_lesson_readiness_and_pool(session, lesson)
+        if existing_active.processing_status == "completed":
+            recompute_lesson_readiness_and_pool(session, lesson)
+            session.commit()
+            return _serialize_contributor_document(existing_active, include_own_text=True)
         session.commit()
+        process_reference_document_extraction(session, existing_active, lesson)
+        session.refresh(existing_active)
         return _serialize_contributor_document(existing_active, include_own_text=True)
 
     next_version = 1
