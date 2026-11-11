@@ -34,19 +34,24 @@ client = TestClient(main.app)
 
 
 def test_postgres_url_normalization_and_engine_creation():
-    """Verify postgres:// and postgresql:// URLs normalize to postgresql+psycopg:// and create valid dialect engines."""
+    """Verify postgres:// and postgresql:// (including Neon pooled URLs) normalize to postgresql+psycopg:// and create valid dialect engines."""
     assert normalize_database_url("postgres://user:pass@localhost:5432/recallai") == (
         "postgresql+psycopg://user:pass@localhost:5432/recallai"
     )
     assert normalize_database_url("postgresql://user:pass@localhost:5432/recallai") == (
         "postgresql+psycopg://user:pass@localhost:5432/recallai"
     )
+    neon_pooled = "postgresql://neondb_owner:secret@ep-cool-darkness-123456-pooler.us-east-2.aws.neon.tech/neondb?sslmode=require"
+    assert normalize_database_url(neon_pooled) == (
+        "postgresql+psycopg://neondb_owner:secret@ep-cool-darkness-123456-pooler.us-east-2.aws.neon.tech/neondb?sslmode=require"
+    )
     assert normalize_database_url("sqlite:///./recallai.db") == "sqlite:///./recallai.db"
 
-    pg_engine = build_db_engine("postgres://user:pass@localhost:5432/recallai")
+    pg_engine = build_db_engine(neon_pooled)
     try:
         assert pg_engine.dialect.name == "postgresql"
         assert pg_engine.dialect.driver == "psycopg"
+        assert pg_engine.pool._pre_ping is True
     finally:
         pg_engine.dispose()
 

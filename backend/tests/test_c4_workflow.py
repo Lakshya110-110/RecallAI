@@ -99,6 +99,8 @@ def test_c4_rating_rejects_invalid_inputs():
     with pytest.raises(ValueError):
         calculate_c4_rating(-1)
     with pytest.raises(ValueError):
+        calculate_c4_rating(16)
+    with pytest.raises(ValueError):
         calculate_c4_rating(True)  # type: ignore[arg-type]
 
 

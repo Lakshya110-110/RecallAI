@@ -9,16 +9,16 @@ def calculate_c4_rating(matched_count: int) -> int:
     """
     Deterministic C4 rating calculation based on distinct matched reference concepts.
     Thresholds (inclusive):
-      13 or more -> 5
-      11-12      -> 4
-      8-10       -> 3
-      5-7        -> 2
-      0-4        -> 1
+      13-15 -> 5
+      11-12 -> 4
+      8-10  -> 3
+      5-7   -> 2
+      0-4   -> 1
     """
     if not isinstance(matched_count, int) or isinstance(matched_count, bool):
         raise ValueError("matched_count must be an integer")
-    if matched_count < 0:
-        raise ValueError("matched_count cannot be negative")
+    if matched_count < 0 or matched_count > 15:
+        raise ValueError("matched_count must be between 0 and 15")
     if matched_count >= 13:
         return 5
     if matched_count >= 11:
