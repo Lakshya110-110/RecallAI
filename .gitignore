@@ -1,0 +1,20 @@
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+api key.txt
+*api_key*
+*.db
+*.sqlite
+*.sqlite3
+backend/reports/
+backend/uploads/
+frontend/node_modules/
+frontend/dist/
+__pycache__/
+.pytest_cache/
+.venv/
