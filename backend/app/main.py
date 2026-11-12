@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import threading
 import time
 from typing import Any
 import uuid
@@ -23,10 +24,11 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
-     Integer,
+    Integer,
     String,
     Text,
     UniqueConstraint,
+    case,
     create_engine,
     func,
     inspect,
@@ -96,11 +98,23 @@ def normalize_database_url(raw_url: str | None) -> str:
 
 
 def build_db_engine(raw_url: str | None):
-    """Create a dialect-aware SQLAlchemy Engine (SQLite vs PostgreSQL)."""
+    """Create a dialect-aware SQLAlchemy Engine (SQLite vs PostgreSQL) with Neon-safe pooling."""
     normalized_url = normalize_database_url(raw_url)
     if normalized_url.startswith("sqlite"):
         return create_engine(normalized_url, connect_args={"check_same_thread": False})
-    return create_engine(normalized_url, pool_pre_ping=True)
+    pool_size = int(os.getenv("DB_POOL_SIZE", "20"))
+    max_overflow = int(os.getenv("DB_MAX_OVERFLOW", "20"))
+    pool_timeout = float(os.getenv("DB_POOL_TIMEOUT", "30.0"))
+    pool_recycle = int(os.getenv("DB_POOL_RECYCLE", "300"))
+    return create_engine(
+        normalized_url,
+        pool_pre_ping=True,
+        pool_size=pool_size,
+        max_overflow=max_overflow,
+        pool_timeout=pool_timeout,
+        pool_recycle=pool_recycle,
+        pool_use_lifo=True,
+    )
 
 
 DATABASE_URL = normalize_database_url(os.getenv("DATABASE_URL"))
@@ -115,9 +129,26 @@ ALLOWED_EMAIL_DOMAIN = "@rvu.edu.in"
 CURRENT_SCHEMA_VERSION = "2026.11.c4-postgres-v1"
 
 # NVIDIA Nemotron assessment configuration
-NVIDIA_TIMEOUT_SECONDS = float(os.getenv("NVIDIA_TIMEOUT_SECONDS", "90.0"))
+NVIDIA_TIMEOUT_SECONDS = float(os.getenv("NVIDIA_TIMEOUT_SECONDS", "25.0"))
 NVIDIA_MAX_RETRIES = int(os.getenv("NVIDIA_MAX_RETRIES", "2"))
 NVIDIA_C4_MAX_TOKENS = int(os.getenv("NVIDIA_C4_MAX_TOKENS", "1536"))
+
+# Bounded concurrency and deduplication for background AI assessments
+_ASSESSMENT_REGISTRY_LOCK = threading.Lock()
+_IN_FLIGHT_ASSESSMENTS: set[int] = set()
+_SUBMISSION_LOCKS: dict[int, threading.Lock] = {}
+_ASSESSMENT_SEMAPHORE = threading.BoundedSemaphore(
+    max(1, int(os.getenv("MAX_CONCURRENT_ASSESSMENTS", "8")))
+)
+
+
+def _get_submission_lock(submission_id: int) -> threading.Lock:
+    with _ASSESSMENT_REGISTRY_LOCK:
+        lock = _SUBMISSION_LOCKS.get(submission_id)
+        if lock is None:
+            lock = threading.Lock()
+            _SUBMISSION_LOCKS[submission_id] = lock
+        return lock
 
 
 def normalize_and_validate_rvu_email(raw_email: str) -> str:
@@ -378,6 +409,14 @@ def run_schema_migrations(target_engine):
         if "report_title" not in doc_columns:
             connection.execute(text("ALTER TABLE reference_documents ADD COLUMN report_title VARCHAR(255)"))
 
+        # Composite indexes for high-concurrency classroom query plans
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_submissions_submitted_at ON submissions (submitted_at DESC)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_submissions_lesson_student ON submissions (lesson_id, student_id)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_submissions_lesson_status ON submissions (lesson_id, assessment_status)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_notifications_user_created ON notifications (user_id, created_at DESC)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_ref_docs_lesson_active_status ON reference_documents (lesson_id, is_active, processing_status)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_ref_pools_lesson_active_ver ON reference_keyword_pools (lesson_id, is_active, version DESC)"))
+
         existing_ver = connection.execute(
             text("SELECT version FROM schema_migrations WHERE version = :v"),
             {"v": CURRENT_SCHEMA_VERSION},
@@ -388,7 +427,7 @@ def run_schema_migrations(target_engine):
                 {"v": CURRENT_SCHEMA_VERSION},
             )
 
-    if is_postgres:
+    if is_postgres and not existing_ver:
         sync_postgres_sequences(target_engine)
 
 
@@ -652,8 +691,10 @@ def require_contributor_for_lesson(session: Session, lesson_id: int, user: User)
 
 
 def migrate_subjects(session: Session):
-    session.execute(update(Lesson).values(subject=SUPPORTED_SUBJECT).where(Lesson.subject != SUPPORTED_SUBJECT))
-    session.commit()
+    needs_update = session.scalar(select(Lesson.id).where(Lesson.subject != SUPPORTED_SUBJECT).limit(1))
+    if needs_update is not None:
+        session.execute(update(Lesson).values(subject=SUPPORTED_SUBJECT).where(Lesson.subject != SUPPORTED_SUBJECT))
+        session.commit()
 
 
 def _ensure_contributor_assigned_to_demo_c4(session: Session):
@@ -703,9 +744,8 @@ def _ensure_contributor_assigned_to_demo_c4(session: Session):
         session.add(c4_lesson)
         session.flush()
 
-    # Clean up any invalid, non-rvu, faculty, or excess (> 3) contributor assignments on all C4 lessons
-    all_c4_lessons = session.scalars(select(Lesson).where(Lesson.assessment_mode == "c4")).all()
-    for les in all_c4_lessons:
+    # Clean up any invalid, non-rvu, faculty, or excess (> 3) contributor assignments on the demo C4 lesson only
+    for les in [c4_lesson]:
         les_assignments = session.scalars(
             select(ContributorAssignment)
             .where(ContributorAssignment.lesson_id == les.id)
@@ -1157,7 +1197,7 @@ def nvidia_assess(lesson: Lesson, submission: Submission) -> NvidiaAssessment:
                 _redact_secrets(str(exc)),
             )
             if attempt < max_retries:
-                time.sleep(1.5 * attempt)  # Brief backoff: 1.5s, 3s
+                time.sleep(0.5 * attempt)  # Brief bounded backoff: 0.5s, 1.0s
                 continue
             raise RuntimeError(
                 f"NVIDIA assessment failed after {max_retries} attempt(s): "
@@ -1307,7 +1347,7 @@ def nvidia_c4_assess(lesson: Lesson, submission: Submission, pool_data: dict[str
                 _redact_secrets(str(exc)),
             )
             if attempt < max_retries:
-                time.sleep(1.5 * attempt)  # Brief backoff: 1.5s, 3s
+                time.sleep(0.5 * attempt)  # Brief bounded backoff: 0.5s, 1.0s
                 continue
             raise RuntimeError(
                 f"NVIDIA C4 assessment failed after {max_retries} attempt(s) "
@@ -1850,97 +1890,144 @@ def list_eligible_contributors_shared(
     return _query_eligible_contributors(session)
 
 
-def _lesson_summary_metrics(session: Session, lesson: Lesson) -> dict[str, Any]:
-    creator = session.get(User, lesson.created_by)
-    assignments = session.scalars(
-        select(ContributorAssignment)
-        .where(ContributorAssignment.lesson_id == lesson.id)
+def _batch_lesson_summary_metrics(session: Session, lessons_list: list[Lesson]) -> dict[int, dict[str, Any]]:
+    """
+    Compute lesson summary metrics for all supplied lessons using batched SQL aggregations
+    instead of 8 N+1 queries per lesson.
+    """
+    if not lessons_list:
+        return {}
+
+    lesson_ids = [l.id for l in lessons_list]
+    creator_ids = list({l.created_by for l in lessons_list if l.created_by is not None})
+
+    # 1. Batch fetch creators
+    creators_by_id: dict[int, User] = {}
+    if creator_ids:
+        for u in session.scalars(select(User).where(User.id.in_(creator_ids))).all():
+            creators_by_id[u.id] = u
+
+    # 2. Batch fetch contributor assignments
+    assignments_by_lesson: dict[int, list[int]] = {lid: [] for lid in lesson_ids}
+    req_by_lesson: dict[int, int] = {l.id: l.required_contributors for l in lessons_list}
+    for row in session.execute(
+        select(ContributorAssignment.lesson_id, ContributorAssignment.student_id)
+        .where(ContributorAssignment.lesson_id.in_(lesson_ids))
         .order_by(ContributorAssignment.id.asc())
-    ).all()
-    assigned_ids = [a.student_id for a in assignments[: lesson.required_contributors]]
-    assigned_count = len(assigned_ids)
+    ).all():
+        lid, sid = int(row[0]), int(row[1])
+        if len(assignments_by_lesson[lid]) < req_by_lesson.get(lid, DEFAULT_REQUIRED_CONTRIBUTORS):
+            assignments_by_lesson[lid].append(sid)
 
-    if assigned_ids:
-        processed_count = int(
-            session.scalar(
-                select(func.count(func.distinct(ReferenceDocument.contributor_id)))
-                .select_from(ReferenceDocument)
-                .where(
-                    ReferenceDocument.lesson_id == lesson.id,
-                    ReferenceDocument.is_active == 1,
-                    ReferenceDocument.contributor_id.in_(assigned_ids),
-                    ReferenceDocument.processing_status == "completed",
-                )
-            )
-            or 0
+    # 3. Batch fetch active reference document status per (lesson_id, contributor_id)
+    uploaded_by_lesson: dict[int, set[int]] = {lid: set() for lid in lesson_ids}
+    processed_by_lesson: dict[int, set[int]] = {lid: set() for lid in lesson_ids}
+    for row in session.execute(
+        select(
+            ReferenceDocument.lesson_id,
+            ReferenceDocument.contributor_id,
+            ReferenceDocument.processing_status,
+        ).where(
+            ReferenceDocument.lesson_id.in_(lesson_ids),
+            ReferenceDocument.is_active == 1,
         )
-        uploaded_count = int(
-            session.scalar(
-                select(func.count(func.distinct(ReferenceDocument.contributor_id)))
-                .select_from(ReferenceDocument)
-                .where(
-                    ReferenceDocument.lesson_id == lesson.id,
-                    ReferenceDocument.is_active == 1,
-                    ReferenceDocument.contributor_id.in_(assigned_ids),
-                )
-            )
-            or 0
-        )
-    else:
-        processed_count = 0
-        uploaded_count = 0
+    ).all():
+        lid, cid, pstatus = int(row[0]), int(row[1]), row[2]
+        if cid in assignments_by_lesson.get(lid, []):
+            uploaded_by_lesson[lid].add(cid)
+            if pstatus == "completed":
+                processed_by_lesson[lid].add(cid)
 
-    sub_count = int(
-        session.scalar(
-            select(func.count()).select_from(Submission).where(Submission.lesson_id == lesson.id)
+    # 4. Batch aggregate submission counts and average rating per lesson in a single GROUP BY query
+    sub_stats_by_lesson: dict[int, tuple[int, int, float | None]] = {}
+    for row in session.execute(
+        select(
+            Submission.lesson_id,
+            func.count(Submission.id),
+            func.sum(case((Submission.assessment_status == "completed", 1), else_=0)),
+            func.avg(
+                case(
+                    (
+                        (Submission.assessment_status == "completed") & Submission.rating.is_not(None),
+                        Submission.rating,
+                    ),
+                    else_=None,
+                )
+            ),
         )
-        or 0
-    )
-    completed_sub_count = int(
-        session.scalar(
-            select(func.count())
-            .select_from(Submission)
-            .where(Submission.lesson_id == lesson.id, Submission.assessment_status == "completed")
+        .where(Submission.lesson_id.in_(lesson_ids))
+        .group_by(Submission.lesson_id)
+    ).all():
+        lid = int(row[0])
+        sub_stats_by_lesson[lid] = (
+            int(row[1] or 0),
+            int(row[2] or 0),
+            round(float(row[3]), 2) if row[3] is not None else None,
         )
-        or 0
-    )
-    avg_rating = session.scalar(
-        select(func.avg(Submission.rating)).where(
-            Submission.lesson_id == lesson.id,
-            Submission.assessment_status == "completed",
-            Submission.rating.is_not(None),
+
+    # 5. Batch fetch active reference keyword pool metadata (excluding large pool_snapshot_json)
+    pool_by_lesson: dict[int, tuple[int, str | None]] = {}
+    for row in session.execute(
+        select(
+            ReferenceKeywordPool.lesson_id,
+            ReferenceKeywordPool.distinct_concepts_count,
+            ReferenceKeywordPool.warning,
+            ReferenceKeywordPool.version,
         )
-    )
-    active_pool = session.scalar(
-        select(ReferenceKeywordPool)
-        .where(ReferenceKeywordPool.lesson_id == lesson.id, ReferenceKeywordPool.is_active == 1)
-        .order_by(ReferenceKeywordPool.version.desc())
-    )
-    return {
-        "created_by": lesson.created_by,
-        "creator_name": creator.name if creator else "Faculty",
-        "creator_role": creator.role if creator else "faculty",
-        "assigned_contributors_count": assigned_count,
-        "uploaded_documents_count": uploaded_count,
-        "processed_documents_count": processed_count,
-        "pending_contributors_count": max(0, assigned_count - uploaded_count),
-        "contributor_ids": assigned_ids,
-        "submission_count": sub_count,
-        "completed_submission_count": completed_sub_count,
-        "average_rating": round(float(avg_rating), 2) if avg_rating is not None else None,
-        "pool_ready": bool(active_pool),
-        "distinct_concepts_count": active_pool.distinct_concepts_count if active_pool else 0,
-        "pool_warning": active_pool.warning if active_pool else None,
-    }
+        .where(
+            ReferenceKeywordPool.lesson_id.in_(lesson_ids),
+            ReferenceKeywordPool.is_active == 1,
+        )
+        .order_by(ReferenceKeywordPool.lesson_id.asc(), ReferenceKeywordPool.version.desc())
+    ).all():
+        lid = int(row[0])
+        if lid not in pool_by_lesson:
+            pool_by_lesson[lid] = (int(row[1] or 0), row[2])
+
+    result: dict[int, dict[str, Any]] = {}
+    for lesson in lessons_list:
+        lid = lesson.id
+        creator = creators_by_id.get(lesson.created_by)
+        assigned_ids = assignments_by_lesson.get(lid, [])
+        assigned_count = len(assigned_ids)
+        uploaded_count = len(uploaded_by_lesson.get(lid, set()))
+        processed_count = len(processed_by_lesson.get(lid, set()))
+        sub_count, completed_sub_count, avg_rating = sub_stats_by_lesson.get(lid, (0, 0, None))
+        pool_info = pool_by_lesson.get(lid)
+        result[lid] = {
+            "created_by": lesson.created_by,
+            "creator_name": creator.name if creator else "Faculty",
+            "creator_role": creator.role if creator else "faculty",
+            "assigned_contributors_count": assigned_count,
+            "uploaded_documents_count": uploaded_count,
+            "processed_documents_count": processed_count,
+            "pending_contributors_count": max(0, assigned_count - uploaded_count),
+            "contributor_ids": assigned_ids,
+            "submission_count": sub_count,
+            "completed_submission_count": completed_sub_count,
+            "average_rating": avg_rating,
+            "pool_ready": pool_info is not None,
+            "distinct_concepts_count": pool_info[0] if pool_info is not None else 0,
+            "pool_warning": pool_info[1] if pool_info is not None else None,
+        }
+    return result
+
+
+def _lesson_summary_metrics(session: Session, lesson: Lesson) -> dict[str, Any]:
+    return _batch_lesson_summary_metrics(session, [lesson])[lesson.id]
 
 
 @app.get("/lessons")
 def lessons(user: User = Depends(current_user), session: Session = Depends(db)):
-    contributor_lesson_ids = set(
-        session.scalars(
-            select(ContributorAssignment.lesson_id).where(ContributorAssignment.student_id == user.id)
-        ).all()
-    )
+    if user.role in {"student", "contributor"}:
+        contributor_lesson_ids = set(
+            session.scalars(
+                select(ContributorAssignment.lesson_id).where(ContributorAssignment.student_id == user.id)
+            ).all()
+        )
+    else:
+        contributor_lesson_ids = set()
+
     query = select(Lesson).where(Lesson.subject == SUPPORTED_SUBJECT)
     if user.role == "student":
         query = query.where(Lesson.publication_status == "published")
@@ -1979,9 +2066,10 @@ def lessons(user: User = Depends(current_user), session: Session = Depends(db)):
             for x in rows
         ]
 
+    metrics_by_id = _batch_lesson_summary_metrics(session, rows)
     output = []
     for x in rows:
-        metrics = _lesson_summary_metrics(session, x)
+        metrics = metrics_by_id[x.id]
         is_manager = can_manage_lesson(user, x)
         output.append({
             "id": x.id,
@@ -2138,24 +2226,39 @@ def get_lesson_contributors(
         .where(ContributorAssignment.lesson_id == lesson.id)
         .order_by(ContributorAssignment.id.asc())
     ).all()
-    items = []
-    for a in assignments:
-        st = session.get(User, a.student_id)
-        doc = session.scalar(
+    student_ids = list({a.student_id for a in assignments})
+    students_by_id = (
+        {u.id: u for u in session.scalars(select(User).where(User.id.in_(student_ids))).all()}
+        if student_ids
+        else {}
+    )
+    active_docs = (
+        session.scalars(
             select(ReferenceDocument).where(
                 ReferenceDocument.lesson_id == lesson.id,
-                ReferenceDocument.contributor_id == a.student_id,
+                ReferenceDocument.contributor_id.in_(student_ids),
                 ReferenceDocument.is_active == 1,
             )
-        )
-        kws = []
-        if doc:
-            kw_rows = session.scalars(
-                select(ExtractedKeyword)
-                .where(ExtractedKeyword.document_id == doc.id)
-                .order_by(ExtractedKeyword.position.asc())
-            ).all()
-            kws = [k.raw_keyword for k in kw_rows]
+        ).all()
+        if student_ids
+        else []
+    )
+    docs_by_contributor = {d.contributor_id: d for d in active_docs}
+    doc_ids = [d.id for d in active_docs]
+    kws_by_doc: dict[int, list[str]] = {did: [] for did in doc_ids}
+    if doc_ids:
+        for k in session.scalars(
+            select(ExtractedKeyword)
+            .where(ExtractedKeyword.document_id.in_(doc_ids))
+            .order_by(ExtractedKeyword.document_id.asc(), ExtractedKeyword.position.asc())
+        ).all():
+            kws_by_doc.setdefault(k.document_id, []).append(k.raw_keyword)
+
+    items = []
+    for a in assignments:
+        st = students_by_id.get(a.student_id)
+        doc = docs_by_contributor.get(a.student_id)
+        kws = kws_by_doc.get(doc.id, []) if doc else []
         items.append({
             "student_id": a.student_id,
             "student_name": st.name if st else "",
@@ -2197,20 +2300,32 @@ def list_my_contributor_assignments(
         .where(ContributorAssignment.student_id == user.id)
         .order_by(ContributorAssignment.assigned_at.desc())
     ).all()
-    results = []
-    for a in assignments:
-        lesson = session.get(Lesson, a.lesson_id)
-        if not lesson:
-            continue
-        doc = session.scalar(
+    lesson_ids = list({a.lesson_id for a in assignments})
+    lessons_by_id = (
+        {l.id: l for l in session.scalars(select(Lesson).where(Lesson.id.in_(lesson_ids))).all()}
+        if lesson_ids
+        else {}
+    )
+    docs_by_lesson: dict[int, ReferenceDocument] = {}
+    if lesson_ids:
+        for d in session.scalars(
             select(ReferenceDocument)
             .where(
-                ReferenceDocument.lesson_id == lesson.id,
+                ReferenceDocument.lesson_id.in_(lesson_ids),
                 ReferenceDocument.contributor_id == user.id,
                 ReferenceDocument.is_active == 1,
             )
             .order_by(ReferenceDocument.version.desc(), ReferenceDocument.id.desc())
-        )
+        ).all():
+            if d.lesson_id not in docs_by_lesson:
+                docs_by_lesson[d.lesson_id] = d
+
+    results = []
+    for a in assignments:
+        lesson = lessons_by_id.get(a.lesson_id)
+        if not lesson:
+            continue
+        doc = docs_by_lesson.get(lesson.id)
         results.append({
             "lesson_id": lesson.id,
             "lesson_title": lesson.title,
@@ -2251,9 +2366,15 @@ def list_my_contributor_uploads(
         .where(ReferenceDocument.contributor_id == user.id)
         .order_by(ReferenceDocument.uploaded_at.desc())
     ).all()
+    lesson_ids = list({d.lesson_id for d in docs})
+    lessons_by_id = (
+        {l.id: l for l in session.scalars(select(Lesson).where(Lesson.id.in_(lesson_ids))).all()}
+        if lesson_ids
+        else {}
+    )
     results = []
     for doc in docs:
-        lesson = session.get(Lesson, doc.lesson_id)
+        lesson = lessons_by_id.get(doc.lesson_id)
         results.append({
             "id": doc.id,
             "document_uuid": doc.document_uuid,
@@ -2589,14 +2710,26 @@ def list_lesson_reference_documents(
         .where(ReferenceDocument.lesson_id == lesson_id, ReferenceDocument.is_active == 1)
         .order_by(ReferenceDocument.uploaded_at.asc())
     ).all()
+    contributor_ids = list({d.contributor_id for d in docs})
+    contributors_by_id = (
+        {u.id: u for u in session.scalars(select(User).where(User.id.in_(contributor_ids))).all()}
+        if contributor_ids
+        else {}
+    )
+    doc_ids = [d.id for d in docs]
+    kws_by_doc: dict[int, list[ExtractedKeyword]] = {did: [] for did in doc_ids}
+    if doc_ids and user.role == "faculty":
+        for k in session.scalars(
+            select(ExtractedKeyword)
+            .where(ExtractedKeyword.document_id.in_(doc_ids))
+            .order_by(ExtractedKeyword.document_id.asc(), ExtractedKeyword.position.asc())
+        ).all():
+            kws_by_doc.setdefault(k.document_id, []).append(k)
+
     results = []
     for doc in docs:
-        contributor = session.get(User, doc.contributor_id)
-        kws = session.scalars(
-            select(ExtractedKeyword)
-            .where(ExtractedKeyword.document_id == doc.id)
-            .order_by(ExtractedKeyword.position.asc())
-        ).all()
+        contributor = contributors_by_id.get(doc.contributor_id)
+        kws = kws_by_doc.get(doc.id, [])
         results.append({
             "id": doc.id,
             "document_uuid": doc.document_uuid,
@@ -2688,15 +2821,32 @@ def _enrich_pool_snapshot_for_faculty(session: Session, snap: dict[str, Any]) ->
     are populated for faculty review even on snapshots created before schema enrichment.
     Does not mutate historical database rows unless explicitly reviewed.
     """
+    needed_cids: set[int] = set()
+    for se in snap.get("source_entries", []):
+        if not se.get("contributor_name") and se.get("contributor_id") is not None:
+            needed_cids.add(int(se["contributor_id"]))
+    for dc in snap.get("distinct_concepts", []):
+        if not dc.get("source_contributor_names"):
+            for cid in dc.get("source_contributor_ids") or []:
+                if cid is not None:
+                    needed_cids.add(int(cid))
+        for me in dc.get("merged_entries", []):
+            if not me.get("contributor_name") and me.get("contributor_id") is not None:
+                needed_cids.add(int(me["contributor_id"]))
+
     user_name_cache: dict[int, str] = {}
+    if needed_cids:
+        for u in session.scalars(select(User).where(User.id.in_(needed_cids))).all():
+            user_name_cache[u.id] = u.name
 
     def _get_cname(cid: int | None) -> str:
         if cid is None:
             return ""
-        if cid not in user_name_cache:
-            u = session.get(User, int(cid))
-            user_name_cache[cid] = u.name if u else f"Contributor #{cid}"
-        return user_name_cache[cid]
+        icid = int(cid)
+        if icid not in user_name_cache:
+            u = session.get(User, icid)
+            user_name_cache[icid] = u.name if u else f"Contributor #{icid}"
+        return user_name_cache[icid]
 
     source_entries = list(snap.get("source_entries", []))
     for se in source_entries:
@@ -2891,204 +3041,228 @@ def _execute_submission_assessment(session: Session, item: Submission, lesson: L
     """
     Execute assessment for a single Submission (either legacy mode or C4 mode)
     within the given database session.
+    Releases the database transaction before invoking the external NVIDIA API so long-running
+    AI calls never hold PostgreSQL connections or block ordinary dashboard requests.
     Raises an exception on AI failure after recording 'failed' state and clearing stale scores.
     """
-    item.assessment_status = "processing"
-    item.recall_percentage = None
-    item.rating = None
-    item.similarity = None
-    session.commit()
-
-    try:
+    submission_lock = _get_submission_lock(item.id)
+    with submission_lock:
+        pool: ReferenceKeywordPool | None = None
         if lesson.assessment_mode == "c4":
             pool = session.scalar(
                 select(ReferenceKeywordPool)
                 .where(ReferenceKeywordPool.lesson_id == lesson.id, ReferenceKeywordPool.is_active == 1)
                 .order_by(ReferenceKeywordPool.version.desc())
             )
-            if not pool or lesson.readiness_status != "ready_for_assessment":
-                raise RuntimeError("C4 reference keyword pool is not ready for assessment")
 
-            pool_data = json.loads(pool.pool_snapshot_json)
-            ai_match_resp = nvidia_c4_assess(lesson, item, pool_data)
-            ai_matches_raw = [c.model_dump() for c in ai_match_resp.concept_results]
-            c4_eval = evaluate_c4_reflection(
-                reflection_text=item.text,
-                pool_data=pool_data,
-                ai_concept_matches=ai_matches_raw,
-                ai_feedback=ai_match_resp.feedback,
-            )
-
-            overlap = compare_text(" ".join(c["display_concept"] for c in pool_data.get("distinct_concepts", [])), item.text)
-            item.assessment_mode = "c4"
-            item.pool_version = pool.version
-            item.matched_concepts_count = c4_eval["matched_count"]
-            item.total_pool_concepts = c4_eval["total_distinct_concepts"]
-            item.recall_percentage = c4_eval["recall_percentage"]
-            item.rating = c4_eval["c4_rating"]
-            item.similarity = overlap["percentage"]
-            item.feedback = c4_eval["explanation"]
-            strengths, areas = _build_learning_summary(
-                item.rating,
-                item.matched_concepts_count,
-                item.total_pool_concepts,
-            )
-            item.assessment_details = json.dumps({
-                "assessment_mode": "c4",
-                "pool_version": pool.version,
-                "total_raw_keywords": pool.total_raw_keywords,
-                "total_distinct_concepts": c4_eval["total_distinct_concepts"],
-                "total_canonical_concepts": c4_eval["total_distinct_concepts"],
-                "matched_count": c4_eval["matched_count"],
-                "c4_rating": c4_eval["c4_rating"],
-                "coverage_percentage": c4_eval["coverage_percentage"],
-                "recall_percentage": c4_eval["recall_percentage"],
-                "matched_concepts": c4_eval["matched_concepts"],
-                "unmatched_concepts": c4_eval["unmatched_concepts"],
-                "concept_results": c4_eval["concept_results"],
-                "missing_concepts": c4_eval["missing_concepts"],
-                "review_status": "pending_review",
-                "reviewed_by": None,
-                "reviewed_at": None,
-                "review_notes": None,
-                "strengths": strengths,
-                "areas_for_improvement": areas,
-                "feedback": c4_eval["explanation"],
-            })
-            item.assessment_status = "completed"
-
-            used_model_name = getattr(ai_match_resp, "_model_used", None) or os.getenv("NVIDIA_MODEL", "nemotron")
-            existing_c4 = session.scalar(
-                select(C4AssessmentResult).where(C4AssessmentResult.submission_id == item.id)
-            )
-            if existing_c4:
-                existing_c4.pool_id = pool.id
-                existing_c4.pool_version = pool.version
-                existing_c4.total_distinct_concepts = c4_eval["total_distinct_concepts"]
-                existing_c4.matched_count = c4_eval["matched_count"]
-                existing_c4.c4_rating = c4_eval["c4_rating"]
-                existing_c4.matched_concepts_json = json.dumps(c4_eval["matched_concepts"])
-                existing_c4.unmatched_concepts_json = json.dumps(c4_eval["unmatched_concepts"])
-                existing_c4.explanation = c4_eval["explanation"]
-                existing_c4.status = "completed"
-                existing_c4.model_name = used_model_name
-                existing_c4.prompt_version = PROMPT_VERSION
-                existing_c4.assessed_at = datetime.now(timezone.utc)
-            else:
-                session.add(
-                    C4AssessmentResult(
-                        submission_id=item.id,
-                        lesson_id=lesson.id,
-                        pool_id=pool.id,
-                        pool_version=pool.version,
-                        total_distinct_concepts=c4_eval["total_distinct_concepts"],
-                        matched_count=c4_eval["matched_count"],
-                        c4_rating=c4_eval["c4_rating"],
-                        matched_concepts_json=json.dumps(c4_eval["matched_concepts"]),
-                        unmatched_concepts_json=json.dumps(c4_eval["unmatched_concepts"]),
-                        explanation=c4_eval["explanation"],
-                        status="completed",
-                        model_name=used_model_name,
-                        prompt_version=PROMPT_VERSION,
-                    )
-                )
-
-            create_notification(
-                session,
-                item.student_id,
-                "Assessment Complete",
-                f"Your reflection for '{lesson.title}' received a C4 rating of {item.rating}/5.",
-                "assessment_complete",
-                "results",
-                item.id,
-            )
-            create_notification(
-                session,
-                lesson.created_by,
-                "C4 Assessment Evaluated",
-                f"Submission #{item.id} for '{lesson.title}' matched {c4_eval['matched_count']}/{c4_eval['total_distinct_concepts']} concepts (C4 rating: {item.rating}/5).",
-                "assessment_complete",
-                "submissions",
-                item.id,
-            )
-        else:
-            ai_result = nvidia_assess(lesson, item)
-            overlap = compare_text(lesson.reference_text, item.text)
-            item.recall_percentage = ai_result.recall_percentage
-            item.rating = rating_for_recall(item.recall_percentage)
-            item.similarity = overlap["percentage"]
-            item.feedback = ai_result.feedback
-            raw_dump = ai_result.model_dump()
-            strengths, areas = _build_learning_summary(item.rating, None, None)
-            raw_dump["strengths"] = strengths
-            raw_dump["areas_for_improvement"] = areas
-            item.assessment_details = json.dumps(raw_dump)
-            item.assessment_status = "completed"
-            create_notification(
-                session,
-                item.student_id,
-                "Assessment Complete",
-                f"Your reflection for '{lesson.title}' was evaluated: {item.recall_percentage}% recall ({item.rating}/5 stars).",
-                "assessment_complete",
-                "results",
-                item.id,
-            )
-            create_notification(
-                session,
-                lesson.created_by,
-                "Assessment Evaluated",
-                f"Submission #{item.id} for '{lesson.title}' completed assessment ({item.recall_percentage}% recall).",
-                "assessment_complete",
-                "submissions",
-                item.id,
-            )
-        session.commit()
-    except Exception as error:
-        item.assessment_status = "failed"
+        item.assessment_status = "processing"
         item.recall_percentage = None
         item.rating = None
-        item.feedback = f"Assessment failed: {type(error).__name__}: {error}. Retry after checking the model configuration."
-        create_notification(
-            session,
-            item.student_id,
-            "Assessment Processing Note",
-            f"Automated assessment for '{lesson.title}' encountered an error. Your reflection was saved.",
-            "assessment_failed",
-            "submissions",
-            item.id,
-        )
-        create_notification(
-            session,
-            lesson.created_by,
-            "Assessment Failed",
-            f"Assessment for submission #{item.id} failed and may require a retry.",
-            "assessment_failed",
-            "submissions",
-            item.id,
-        )
+        item.similarity = None
+        # Commit immediately so the DB connection is returned to the pool BEFORE external AI HTTP calls
         session.commit()
-        raise
+
+        try:
+            if lesson.assessment_mode == "c4":
+                if not pool or lesson.readiness_status != "ready_for_assessment":
+                    raise RuntimeError("C4 reference keyword pool is not ready for assessment")
+
+                pool_data = json.loads(pool.pool_snapshot_json)
+                # External NVIDIA API call runs with zero DB connection checked out
+                ai_match_resp = nvidia_c4_assess(lesson, item, pool_data)
+                ai_matches_raw = [c.model_dump() for c in ai_match_resp.concept_results]
+                c4_eval = evaluate_c4_reflection(
+                    reflection_text=item.text,
+                    pool_data=pool_data,
+                    ai_concept_matches=ai_matches_raw,
+                    ai_feedback=ai_match_resp.feedback,
+                )
+
+                overlap = compare_text(" ".join(c["display_concept"] for c in pool_data.get("distinct_concepts", [])), item.text)
+                item.assessment_mode = "c4"
+                item.pool_version = pool.version
+                item.matched_concepts_count = c4_eval["matched_count"]
+                item.total_pool_concepts = c4_eval["total_distinct_concepts"]
+                item.recall_percentage = c4_eval["recall_percentage"]
+                item.rating = c4_eval["c4_rating"]
+                item.similarity = overlap["percentage"]
+                item.feedback = c4_eval["explanation"]
+                strengths, areas = _build_learning_summary(
+                    item.rating,
+                    item.matched_concepts_count,
+                    item.total_pool_concepts,
+                )
+                item.assessment_details = json.dumps({
+                    "assessment_mode": "c4",
+                    "pool_version": pool.version,
+                    "total_raw_keywords": pool.total_raw_keywords,
+                    "total_distinct_concepts": c4_eval["total_distinct_concepts"],
+                    "total_canonical_concepts": c4_eval["total_distinct_concepts"],
+                    "matched_count": c4_eval["matched_count"],
+                    "c4_rating": c4_eval["c4_rating"],
+                    "coverage_percentage": c4_eval["coverage_percentage"],
+                    "recall_percentage": c4_eval["recall_percentage"],
+                    "matched_concepts": c4_eval["matched_concepts"],
+                    "unmatched_concepts": c4_eval["unmatched_concepts"],
+                    "concept_results": c4_eval["concept_results"],
+                    "missing_concepts": c4_eval["missing_concepts"],
+                    "review_status": "pending_review",
+                    "reviewed_by": None,
+                    "reviewed_at": None,
+                    "review_notes": None,
+                    "strengths": strengths,
+                    "areas_for_improvement": areas,
+                    "feedback": c4_eval["explanation"],
+                })
+                item.assessment_status = "completed"
+
+                used_model_name = getattr(ai_match_resp, "_model_used", None) or os.getenv("NVIDIA_MODEL", "nemotron")
+                existing_c4 = session.scalar(
+                    select(C4AssessmentResult).where(C4AssessmentResult.submission_id == item.id)
+                )
+                if existing_c4:
+                    existing_c4.pool_id = pool.id
+                    existing_c4.pool_version = pool.version
+                    existing_c4.total_distinct_concepts = c4_eval["total_distinct_concepts"]
+                    existing_c4.matched_count = c4_eval["matched_count"]
+                    existing_c4.c4_rating = c4_eval["c4_rating"]
+                    existing_c4.matched_concepts_json = json.dumps(c4_eval["matched_concepts"])
+                    existing_c4.unmatched_concepts_json = json.dumps(c4_eval["unmatched_concepts"])
+                    existing_c4.explanation = c4_eval["explanation"]
+                    existing_c4.status = "completed"
+                    existing_c4.model_name = used_model_name
+                    existing_c4.prompt_version = PROMPT_VERSION
+                    existing_c4.assessed_at = datetime.now(timezone.utc)
+                else:
+                    session.add(
+                        C4AssessmentResult(
+                            submission_id=item.id,
+                            lesson_id=lesson.id,
+                            pool_id=pool.id,
+                            pool_version=pool.version,
+                            total_distinct_concepts=c4_eval["total_distinct_concepts"],
+                            matched_count=c4_eval["matched_count"],
+                            c4_rating=c4_eval["c4_rating"],
+                            matched_concepts_json=json.dumps(c4_eval["matched_concepts"]),
+                            unmatched_concepts_json=json.dumps(c4_eval["unmatched_concepts"]),
+                            explanation=c4_eval["explanation"],
+                            status="completed",
+                            model_name=used_model_name,
+                            prompt_version=PROMPT_VERSION,
+                        )
+                    )
+
+                create_notification(
+                    session,
+                    item.student_id,
+                    "Assessment Complete",
+                    f"Your reflection for '{lesson.title}' received a C4 rating of {item.rating}/5.",
+                    "assessment_complete",
+                    "results",
+                    item.id,
+                )
+                create_notification(
+                    session,
+                    lesson.created_by,
+                    "C4 Assessment Evaluated",
+                    f"Submission #{item.id} for '{lesson.title}' matched {c4_eval['matched_count']}/{c4_eval['total_distinct_concepts']} concepts (C4 rating: {item.rating}/5).",
+                    "assessment_complete",
+                    "submissions",
+                    item.id,
+                )
+            else:
+                # External NVIDIA API call runs with zero DB connection checked out
+                ai_result = nvidia_assess(lesson, item)
+                overlap = compare_text(lesson.reference_text, item.text)
+                item.recall_percentage = ai_result.recall_percentage
+                item.rating = rating_for_recall(item.recall_percentage)
+                item.similarity = overlap["percentage"]
+                item.feedback = ai_result.feedback
+                raw_dump = ai_result.model_dump()
+                strengths, areas = _build_learning_summary(item.rating, None, None)
+                raw_dump["strengths"] = strengths
+                raw_dump["areas_for_improvement"] = areas
+                item.assessment_details = json.dumps(raw_dump)
+                item.assessment_status = "completed"
+                create_notification(
+                    session,
+                    item.student_id,
+                    "Assessment Complete",
+                    f"Your reflection for '{lesson.title}' was evaluated: {item.recall_percentage}% recall ({item.rating}/5 stars).",
+                    "assessment_complete",
+                    "results",
+                    item.id,
+                )
+                create_notification(
+                    session,
+                    lesson.created_by,
+                    "Assessment Evaluated",
+                    f"Submission #{item.id} for '{lesson.title}' completed assessment ({item.recall_percentage}% recall).",
+                    "assessment_complete",
+                    "submissions",
+                    item.id,
+                )
+            session.commit()
+        except Exception as error:
+            item.assessment_status = "failed"
+            item.recall_percentage = None
+            item.rating = None
+            item.feedback = f"Assessment failed: {type(error).__name__}: {error}. Retry after checking the model configuration."
+            create_notification(
+                session,
+                item.student_id,
+                "Assessment Processing Note",
+                f"Automated assessment for '{lesson.title}' encountered an error. Your reflection was saved.",
+                "assessment_failed",
+                "submissions",
+                item.id,
+            )
+            create_notification(
+                session,
+                lesson.created_by,
+                "Assessment Failed",
+                f"Assessment for submission #{item.id} failed and may require a retry.",
+                "assessment_failed",
+                "submissions",
+                item.id,
+            )
+            session.commit()
+            raise
 
 
 def run_assessment_background(submission_id: int, database_url: str):
-    """Run assessment in a background task with its own database session."""
-    bg_engine = build_db_engine(database_url)
-    BgSessionLocal = sessionmaker(bind=bg_engine, expire_on_commit=False)
+    """
+    Run assessment in a background task using the shared connection pool (when targeting DATABASE_URL),
+    bounded concurrency semaphore, and per-submission deduplication guard.
+    """
+    with _ASSESSMENT_REGISTRY_LOCK:
+        if submission_id in _IN_FLIGHT_ASSESSMENTS:
+            return
+        _IN_FLIGHT_ASSESSMENTS.add(submission_id)
+
+    normalized_target = normalize_database_url(database_url)
+    use_shared_engine = normalized_target == DATABASE_URL
+    bg_engine = None if use_shared_engine else build_db_engine(normalized_target)
+    BgSessionFactory = SessionLocal if use_shared_engine else sessionmaker(bind=bg_engine, expire_on_commit=False)
 
     try:
-        with BgSessionLocal() as session:
-            item = session.get(Submission, submission_id)
-            if not item:
-                return
-            lesson = session.get(Lesson, item.lesson_id)
-            if not lesson or lesson.subject != SUPPORTED_SUBJECT:
-                return
-            try:
-                _execute_submission_assessment(session, item, lesson)
-            except Exception:
-                pass
+        with _ASSESSMENT_SEMAPHORE:
+            with BgSessionFactory() as session:
+                item = session.get(Submission, submission_id)
+                if not item or item.assessment_status == "completed":
+                    return
+                lesson = session.get(Lesson, item.lesson_id)
+                if not lesson or lesson.subject != SUPPORTED_SUBJECT:
+                    return
+                try:
+                    _execute_submission_assessment(session, item, lesson)
+                except Exception:
+                    pass
     finally:
-        bg_engine.dispose()
+        with _ASSESSMENT_REGISTRY_LOCK:
+            _IN_FLIGHT_ASSESSMENTS.discard(submission_id)
+        if bg_engine is not None:
+            bg_engine.dispose()
 
 
 @app.post("/lessons/{lesson_id}/submissions", status_code=201)
@@ -3110,20 +3284,20 @@ def submit(
         raise HTTPException(404, "Published Business Forecasting session not found")
 
     if lesson.assessment_mode == "c4":
-        active_pool = session.scalar(
-            select(ReferenceKeywordPool).where(
+        active_pool_id = session.scalar(
+            select(ReferenceKeywordPool.id).where(
                 ReferenceKeywordPool.lesson_id == lesson.id,
                 ReferenceKeywordPool.is_active == 1,
             )
         )
-        if lesson.readiness_status != "ready_for_assessment" or not active_pool:
+        if lesson.readiness_status != "ready_for_assessment" or not active_pool_id:
             raise HTTPException(
                 409,
                 f"Session is not ready for student submissions (current status: {lesson.readiness_status})",
             )
 
     duplicate = session.scalar(
-        select(Submission).where(
+        select(Submission.id).where(
             Submission.lesson_id == lesson_id,
             Submission.student_id == user.id,
             Submission.status == "received",
@@ -3142,8 +3316,7 @@ def submit(
         assessment_mode=lesson.assessment_mode,
     )
     session.add(item)
-    session.commit()
-    session.refresh(item)
+    session.flush()
 
     create_notification(
         session,
@@ -3153,6 +3326,7 @@ def submit(
         "submission",
         "submissions",
         item.id,
+        dedup_window_seconds=0,
     )
     create_notification(
         session,
@@ -3162,6 +3336,7 @@ def submit(
         "submission",
         "submissions",
         item.id,
+        dedup_window_seconds=0,
     )
     session.commit()
 
@@ -3176,9 +3351,17 @@ def submit(
     }
 
 
-def serialize_submission(item: Submission, session: Session, viewer_role: str = "faculty"):
-    lesson = session.get(Lesson, item.lesson_id)
-    student = session.get(User, item.student_id)
+def serialize_submission(
+    item: Submission,
+    session: Session,
+    viewer_role: str = "faculty",
+    lesson: Lesson | None = None,
+    student: User | None = None,
+):
+    if lesson is None:
+        lesson = session.get(Lesson, item.lesson_id)
+    if student is None:
+        student = session.get(User, item.student_id)
     raw_details = details_for(item)
     strengths, areas = _build_learning_summary(
         item.rating,
@@ -3242,13 +3425,53 @@ def serialize_submission(item: Submission, session: Session, viewer_role: str = 
     }
 
 
+def serialize_submissions_batch(
+    rows: list[Submission],
+    session: Session,
+    viewer_role: str = "faculty",
+    preloaded_lessons: dict[int, Lesson] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Batch-load all referenced Lesson and User records into strong-referenced dicts
+    so serializing N submissions executes at most 3 SQL queries instead of 1 + 2*N queries.
+    """
+    if not rows:
+        return []
+    lesson_ids = list({x.lesson_id for x in rows})
+    student_ids = list({x.student_id for x in rows})
+    if preloaded_lessons is not None:
+        lessons_by_id = preloaded_lessons
+    else:
+        lessons_by_id = (
+            {l.id: l for l in session.scalars(select(Lesson).where(Lesson.id.in_(lesson_ids))).all()}
+            if lesson_ids
+            else {}
+        )
+    students_by_id = (
+        {u.id: u for u in session.scalars(select(User).where(User.id.in_(student_ids))).all()}
+        if student_ids
+        else {}
+    )
+    return [
+        serialize_submission(
+            x,
+            session,
+            viewer_role=viewer_role,
+            lesson=lessons_by_id.get(x.lesson_id),
+            student=students_by_id.get(x.student_id),
+        )
+        for x in rows
+    ]
+
+
 @app.get("/submissions")
 def submissions(user: User = Depends(current_user), session: Session = Depends(db)):
     query = select(Submission).join(Lesson).where(Lesson.subject == SUPPORTED_SUBJECT)
     if user.role != "faculty":
         query = query.where(Submission.student_id == user.id)
     query = query.order_by(Submission.submitted_at.desc())
-    return [serialize_submission(x, session, viewer_role=user.role) for x in session.scalars(query).all()]
+    rows = session.scalars(query).all()
+    return serialize_submissions_batch(rows, session, viewer_role=user.role)
 
 
 @app.get("/lessons/{lesson_id}/submissions")
@@ -3266,7 +3489,12 @@ def lesson_submissions(
         .where(Submission.lesson_id == lesson_id)
         .order_by(Submission.submitted_at.desc())
     ).all()
-    return [serialize_submission(x, session, viewer_role=user.role) for x in rows]
+    return serialize_submissions_batch(
+        rows,
+        session,
+        viewer_role=user.role,
+        preloaded_lessons={lesson.id: lesson},
+    )
 
 
 @app.get("/submissions/{submission_id}")
@@ -3416,10 +3644,22 @@ def get_lesson_c4_results(
         .where(C4AssessmentResult.lesson_id == lesson_id)
         .order_by(C4AssessmentResult.assessed_at.desc())
     ).all()
+    sub_ids = list({r.submission_id for r in rows})
+    subs_by_id = (
+        {s.id: s for s in session.scalars(select(Submission).where(Submission.id.in_(sub_ids))).all()}
+        if sub_ids
+        else {}
+    )
+    student_ids = list({s.student_id for s in subs_by_id.values()})
+    students_by_id = (
+        {u.id: u for u in session.scalars(select(User).where(User.id.in_(student_ids))).all()}
+        if student_ids
+        else {}
+    )
     output = []
     for r in rows:
-        sub = session.get(Submission, r.submission_id)
-        st = session.get(User, sub.student_id) if sub else None
+        sub = subs_by_id.get(r.submission_id)
+        st = students_by_id.get(sub.student_id) if sub else None
         sub_details = details_for(sub) if sub else {}
         cov_pct = calculate_c4_coverage(
             min(max(0, int(r.matched_count or 0)), max(0, int(r.total_distinct_concepts or 0))),
@@ -3461,23 +3701,48 @@ def get_dashboard_analytics(
 ):
     """
     Real database-driven analytics for Faculty, Student, and Contributor dashboards.
+    Uses lightweight column projections and batched pool lookups to avoid N+1 queries
+    and large JSON column overfetching.
     Never fabricates data; returns empty states when no records exist.
     """
-    all_lessons = session.scalars(
-        select(Lesson).where(Lesson.subject == SUPPORTED_SUBJECT).order_by(Lesson.created_at.asc())
+    lesson_rows = session.execute(
+        select(
+            Lesson.id,
+            Lesson.title,
+            Lesson.publication_status,
+            Lesson.created_by,
+            Lesson.assessment_mode,
+            Lesson.readiness_status,
+            Lesson.concepts,
+        )
+        .where(Lesson.subject == SUPPORTED_SUBJECT)
+        .order_by(Lesson.created_at.asc())
     ).all()
-    published_lessons = [l for l in all_lessons if l.publication_status == "published"]
+    lessons_by_id = {r.id: r for r in lesson_rows}
+    published_lessons = [l for l in lesson_rows if l.publication_status == "published"]
+
+    sub_cols = (
+        Submission.id,
+        Submission.lesson_id,
+        Submission.student_id,
+        Submission.assessment_status,
+        Submission.rating,
+        Submission.recall_percentage,
+        Submission.matched_concepts_count,
+        Submission.total_pool_concepts,
+        Submission.submitted_at,
+    )
 
     if user.role in {"faculty", "contributor"}:
         managed_lessons = (
-            all_lessons
+            lesson_rows
             if user.role == "faculty"
-            else [l for l in all_lessons if l.created_by == user.id]
+            else [l for l in lesson_rows if l.created_by == user.id]
         )
         managed_ids = {l.id for l in managed_lessons}
         all_subs = (
-            session.scalars(
-                select(Submission)
+            session.execute(
+                select(*sub_cols)
                 .where(Submission.lesson_id.in_(managed_ids))
                 .order_by(Submission.submitted_at.asc())
             ).all()
@@ -3486,11 +3751,31 @@ def get_dashboard_analytics(
         )
     else:
         managed_lessons = published_lessons
-        all_subs = session.scalars(
-            select(Submission)
+        managed_ids = {l.id for l in managed_lessons}
+        all_subs = session.execute(
+            select(*sub_cols)
             .where(Submission.student_id == user.id)
             .order_by(Submission.submitted_at.asc())
         ).all()
+
+    # Batch-fetch active ReferenceKeywordPool distinct_concepts_count in 1 query (excluding pool_snapshot_json)
+    pool_concepts_by_lesson: dict[int, int] = {}
+    if managed_ids:
+        for prow in session.execute(
+            select(
+                ReferenceKeywordPool.lesson_id,
+                ReferenceKeywordPool.distinct_concepts_count,
+                ReferenceKeywordPool.version,
+            )
+            .where(
+                ReferenceKeywordPool.lesson_id.in_(managed_ids),
+                ReferenceKeywordPool.is_active == 1,
+            )
+            .order_by(ReferenceKeywordPool.lesson_id.asc(), ReferenceKeywordPool.version.desc())
+        ).all():
+            lid = int(prow[0])
+            if lid not in pool_concepts_by_lesson:
+                pool_concepts_by_lesson[lid] = int(prow[1] or 0)
 
     # 1. Rating Distribution (1 to 5)
     rating_counts = {r: 0 for r in range(1, 6)}
@@ -3521,11 +3806,17 @@ def get_dashboard_analytics(
         {"name": "Awaiting", "value": awaiting_count, "status": "awaiting"},
     ]
 
+    # Pre-group submissions by lesson_id in O(N)
+    subs_by_lesson: dict[int, list[Any]] = {l.id: [] for l in managed_lessons}
+    for s in all_subs:
+        if s.lesson_id in subs_by_lesson:
+            subs_by_lesson[s.lesson_id].append(s)
+
     # 3. Session Comparison (Average Rating & Submission Count per Session)
     session_comparison = []
     concept_coverage = []
     for l in managed_lessons:
-        l_subs = [s for s in all_subs if s.lesson_id == l.id]
+        l_subs = subs_by_lesson.get(l.id, [])
         l_completed = [s for s in l_subs if s.assessment_status == "completed" and s.rating is not None]
         avg_r = (
             round(sum(float(s.rating) for s in l_completed) / len(l_completed), 2)
@@ -3540,13 +3831,9 @@ def get_dashboard_analytics(
             if l_completed
             else 0.0
         )
-        pool = session.scalar(
-            select(ReferenceKeywordPool)
-            .where(ReferenceKeywordPool.lesson_id == l.id, ReferenceKeywordPool.is_active == 1)
-            .order_by(ReferenceKeywordPool.version.desc())
-        )
-        total_concepts = pool.distinct_concepts_count if pool else (
-            len(l.concepts.splitlines()) if l.concepts else 15
+        total_concepts = pool_concepts_by_lesson.get(
+            l.id,
+            len(l.concepts.splitlines()) if l.concepts else 15,
         )
         short_title = l.title if len(l.title) <= 26 else l.title[:24] + "…"
         session_comparison.append({
@@ -3571,7 +3858,7 @@ def get_dashboard_analytics(
     performance_trend = []
     for s in all_subs:
         if s.assessment_status == "completed" and s.rating is not None:
-            lesson_obj = session.get(Lesson, s.lesson_id)
+            lesson_obj = lessons_by_id.get(s.lesson_id)
             performance_trend.append({
                 "submission_id": s.id,
                 "lesson_id": s.lesson_id,
@@ -3584,11 +3871,17 @@ def get_dashboard_analytics(
             })
 
     # 5. Personal Analytics for Student / Contributor
-    my_subs = session.scalars(
-        select(Submission)
-        .where(Submission.student_id == user.id)
-        .order_by(Submission.submitted_at.asc())
-    ).all()
+    if user.role == "student":
+        my_subs = all_subs
+    elif user.role == "faculty":
+        my_subs = [s for s in all_subs if s.student_id == user.id]
+    else:
+        my_subs = session.execute(
+            select(*sub_cols)
+            .where(Submission.student_id == user.id)
+            .order_by(Submission.submitted_at.asc())
+        ).all()
+
     my_completed = [s for s in my_subs if s.assessment_status == "completed" and s.rating is not None]
     my_submitted_lesson_ids = {s.lesson_id for s in my_subs}
     ready_published_lessons = [
@@ -3601,7 +3894,7 @@ def get_dashboard_analytics(
     ]
     personal_trend = []
     for s in my_completed:
-        lesson_obj = session.get(Lesson, s.lesson_id)
+        lesson_obj = lessons_by_id.get(s.lesson_id)
         personal_trend.append({
             "submission_id": s.id,
             "lesson_id": s.lesson_id,
@@ -3713,10 +4006,8 @@ def export(user: User = Depends(role_required("faculty")), session: Session = De
         text_val = "" if value is None else str(value)
         return "'" + text_val if text_val.startswith(("=", "+", "-", "@")) else text_val
 
-    rows = [
-        serialize_submission(x, session, viewer_role="faculty")
-        for x in session.scalars(select(Submission).join(Lesson).where(Lesson.subject == SUPPORTED_SUBJECT)).all()
-    ]
+    sub_rows = session.scalars(select(Submission).join(Lesson).where(Lesson.subject == SUPPORTED_SUBJECT)).all()
+    rows = serialize_submissions_batch(sub_rows, session, viewer_role="faculty")
     rows = [{key: safe(value) for key, value in row.items()} for row in rows]
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -3734,12 +4025,14 @@ def export(user: User = Depends(role_required("faculty")), session: Session = De
 
 @app.get("/notifications")
 def list_notifications(user: User = Depends(current_user), session: Session = Depends(db)):
-    count = session.scalar(select(func.count()).select_from(Notification).where(Notification.user_id == user.id))
-    if count == 0:
-        seed_initial_notifications(session, user)
     rows = session.scalars(
         select(Notification).where(Notification.user_id == user.id).order_by(Notification.created_at.desc()).limit(50)
     ).all()
+    if not rows:
+        seed_initial_notifications(session, user)
+        rows = session.scalars(
+            select(Notification).where(Notification.user_id == user.id).order_by(Notification.created_at.desc()).limit(50)
+        ).all()
     return [
         {
             "id": n.id,

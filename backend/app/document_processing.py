@@ -32,7 +32,7 @@ MIN_EXTRACTED_TEXT_CHARS = 20
 MAX_EXTRACTION_ATTEMPTS = 3
 
 # NVIDIA Nemotron keyword extraction configuration
-NVIDIA_TIMEOUT_SECONDS = float(os.getenv("NVIDIA_TIMEOUT_SECONDS", "90.0"))
+NVIDIA_TIMEOUT_SECONDS = float(os.getenv("NVIDIA_TIMEOUT_SECONDS", "25.0"))
 NVIDIA_MAX_RETRIES = int(os.getenv("NVIDIA_MAX_RETRIES", "2"))
 NVIDIA_MAX_TOKENS = int(os.getenv("NVIDIA_MAX_TOKENS", "512"))
 DEFAULT_NVIDIA_FALLBACK_MODEL = "nvidia/nemotron-3.5-bolt-e4b"
@@ -696,7 +696,7 @@ def call_nemotron_keyword_extraction(document_text: str, subject: str = "Busines
                 _redact_secrets(str(exc)),
             )
             if attempt < max_retries:
-                time.sleep(1.5 * attempt)  # Brief backoff: 1.5s, 3s
+                time.sleep(0.5 * attempt)  # Brief bounded backoff
                 continue
             raise KeywordExtractionError(
                 f"NVIDIA keyword extraction failed after {max_retries} attempt(s): "
@@ -737,7 +737,7 @@ def extract_five_keywords_with_retries(
                 _redact_secrets(str(exc)),
             )
             if attempt < attempts:
-                time.sleep(1.5 * attempt)
+                time.sleep(0.5 * attempt)
 
     raise KeywordExtractionError(
         f"Failed to extract 5 valid distinct keywords after {attempts} attempt(s): "

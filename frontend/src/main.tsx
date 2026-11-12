@@ -58,6 +58,7 @@ import type {
   Lesson,
   Submission,
   ConceptResult,
+  C4MatchedConceptItem,
   Theme,
   AppNotification,
   StudentOption,
@@ -68,7 +69,7 @@ import type {
   DashboardAnalyticsResponse,
 } from './types';
 
-const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:8000';
+const API = ((import.meta as any).env?.VITE_API_URL || 'http://localhost:8000').trim();
 const SUBJECT = 'Business Forecasting';
 const ALLOWED_EMAIL_DOMAIN = '@rvu.edu.in';
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // 10 MB
@@ -202,13 +203,30 @@ function App() {
   const [showNotificationPanel, setShowNotificationPanel] = useState(false);
   const notificationRef = useRef<HTMLDivElement>(null);
   const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [dashboardError, setDashboardError] = useState<string | null>(null);
+  const [hasLoadedLessons, setHasLoadedLessons] = useState(false);
+  const [hasLoadedSubmissions, setHasLoadedSubmissions] = useState(false);
+  const [hasLoadedAnalytics, setHasLoadedAnalytics] = useState(false);
+  const [hasLoadedAssignments, setHasLoadedAssignments] = useState(false);
+  const [lessonsLoadFailed, setLessonsLoadFailed] = useState(false);
+  const [submissionsLoadFailed, setSubmissionsLoadFailed] = useState(false);
+  const [analyticsLoadFailed, setAnalyticsLoadFailed] = useState(false);
+  const [assignmentsLoadFailed, setAssignmentsLoadFailed] = useState(false);
   const [selectedSubmission, setSelectedSubmission] = useState<Submission | null>(null);
+
+  const inFlightGetRef = useRef<Map<string, Promise<any>>>(new Map());
+  const refreshInFlightRef = useRef<Promise<void> | null>(null);
+  const hasLoadedStaticRef = useRef<boolean>(false);
 
   const unreadCount = useMemo(() => notifications.filter(n => !n.is_read).length, [notifications]);
 
   function clearAuthState(expiredMessage?: string) {
     localStorage.removeItem('token');
     localStorage.removeItem('user');
+    inFlightGetRef.current.clear();
+    refreshInFlightRef.current = null;
+    hasLoadedStaticRef.current = false;
     setToken('');
     setUser(null);
     setLessons([]);
@@ -218,6 +236,15 @@ function App() {
     setStudentsList([]);
     setAnalytics(null);
     setNotifications([]);
+    setHasLoadedLessons(false);
+    setHasLoadedSubmissions(false);
+    setHasLoadedAnalytics(false);
+    setHasLoadedAssignments(false);
+    setLessonsLoadFailed(false);
+    setSubmissionsLoadFailed(false);
+    setAnalyticsLoadFailed(false);
+    setAssignmentsLoadFailed(false);
+    setDashboardError(null);
     setShowNotificationPanel(false);
     if (expiredMessage) {
       setNotice({ type: 'error', message: expiredMessage });
@@ -225,92 +252,245 @@ function App() {
   }
 
   async function request(path: string, options: RequestInit = {}) {
-    const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData;
-    const headers: Record<string, string> = {
-      ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...((options.headers as Record<string, string>) || {}),
-    };
-    const response = await fetch(API + path, { ...options, headers });
-    const body = await response.json().catch(() => ({}));
-    if (response.status === 401) {
-      if (token) {
-        clearAuthState('Your session has expired. Please sign in again.');
+    const method = (options.method || 'GET').toUpperCase();
+    const isGet = method === 'GET' && !options.body;
+    const dedupKey = `${token}:${path}`;
+
+    if (isGet) {
+      const existing = inFlightGetRef.current.get(dedupKey);
+      if (existing) {
+        return existing;
       }
-      throw new Error('Authentication expired');
     }
-    if (!response.ok) {
-      let msg = `Request failed (${response.status})`;
-      if (typeof body.detail === 'string') {
-        msg = body.detail;
-      } else if (Array.isArray(body.detail) && body.detail.length > 0) {
-        const firstErr = body.detail[0];
-        const rawMsg = typeof firstErr?.msg === 'string' ? firstErr.msg.replace(/^Value error,\s*/i, '') : '';
-        const locParts = Array.isArray(firstErr?.loc)
-          ? firstErr.loc.filter((p: any) => p !== 'body' && p !== 'query' && p !== 'path')
-          : [];
-        const fieldName = locParts.length > 0 ? String(locParts[locParts.length - 1]) : '';
-        if (rawMsg.toLowerCase() === 'field required' && fieldName) {
-          msg = `Please provide the required ${fieldName.replace(/_/g, ' ')} field.`;
-        } else if (rawMsg) {
-          msg = rawMsg;
+
+    const executeFetch = async () => {
+      const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData;
+      const headers: Record<string, string> = {
+        ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...((options.headers as Record<string, string>) || {}),
+      };
+      const response = await fetch(API + path, { ...options, headers });
+      const body = await response.json().catch(() => ({}));
+      if (response.status === 401) {
+        if (token) {
+          clearAuthState('Your session has expired. Please sign in again.');
         }
+        throw new Error('Authentication expired');
       }
-      throw new Error(msg);
+      if (!response.ok) {
+        let msg = `Request failed (${response.status})`;
+        if (typeof body.detail === 'string') {
+          msg = body.detail;
+        } else if (Array.isArray(body.detail) && body.detail.length > 0) {
+          const firstErr = body.detail[0];
+          const rawMsg = typeof firstErr?.msg === 'string' ? firstErr.msg.replace(/^Value error,\s*/i, '') : '';
+          const locParts = Array.isArray(firstErr?.loc)
+            ? firstErr.loc.filter((p: any) => p !== 'body' && p !== 'query' && p !== 'path')
+            : [];
+          const fieldName = locParts.length > 0 ? String(locParts[locParts.length - 1]) : '';
+          if (rawMsg.toLowerCase() === 'field required' && fieldName) {
+            msg = `Please provide the required ${fieldName.replace(/_/g, ' ')} field.`;
+          } else if (rawMsg) {
+            msg = rawMsg;
+          }
+        }
+        throw new Error(msg);
+      }
+      return body;
+    };
+
+    const promise = executeFetch();
+    if (isGet) {
+      inFlightGetRef.current.set(dedupKey, promise);
+      promise.finally(() => {
+        if (inFlightGetRef.current.get(dedupKey) === promise) {
+          inFlightGetRef.current.delete(dedupKey);
+        }
+      });
     }
-    return body;
+    return promise;
   }
 
   async function refresh(silent = false) {
     if (!token) return;
-    if (!silent) setLoading(true);
-    try {
-      const [meData, lessonData, submissionData, notifData, analyticsData] = await Promise.all([
-        request('/auth/me').catch(err => {
-          if (err.message === 'Authentication expired') throw err;
-          return null;
-        }),
-        request('/lessons'),
-        request('/submissions'),
-        request('/notifications').catch(() => []),
-        request('/analytics/dashboard').catch(() => null),
-      ]);
-      if (meData) {
-        const mergedUser: User = {
-          ...meData,
-          login_portal: user?.login_portal || meData.login_portal || meData.role,
-        };
-        setUser(mergedUser);
-        localStorage.setItem('user', JSON.stringify(mergedUser));
-      }
-      setLessons(lessonData);
-      setSubmissions(submissionData);
-      if (Array.isArray(notifData)) setNotifications(notifData);
-      if (analyticsData) setAnalytics(analyticsData);
-
-      const portalRole: Role =
-        user?.login_portal || meData?.login_portal || meData?.role || user?.role || 'student';
-
-      if (portalRole === 'contributor' || meData?.role === 'contributor') {
-        const [contribData, uploadHistoryData, eligibleRows] = await Promise.all([
-          request('/contributor/assignments').catch(() => []),
-          request('/contributor/uploads').catch(() => []),
-          request('/contributors/eligible').catch(() => []),
-        ]);
-        if (Array.isArray(contribData)) setContributorAssignments(contribData);
-        if (Array.isArray(uploadHistoryData)) setContributorUploads(uploadHistoryData);
-        if (Array.isArray(eligibleRows)) setStudentsList(eligibleRows);
-      } else if (portalRole === 'faculty') {
-        const studentRows = await request('/contributors/eligible').catch(() => []);
-        if (Array.isArray(studentRows)) setStudentsList(studentRows);
-      }
-    } catch (err: any) {
-      if (!silent && err.message !== 'Authentication expired') {
-        setNotice({ type: 'error', message: err.message || 'Failed to load data' });
-      }
-    } finally {
-      if (!silent) setLoading(false);
+    if (refreshInFlightRef.current) {
+      return refreshInFlightRef.current;
     }
+
+    const isInitialLoad = !hasLoadedLessons && !hasLoadedSubmissions;
+    if (!silent) {
+      if (isInitialLoad) {
+        setLoading(true);
+      } else {
+        setRefreshing(true);
+      }
+      setDashboardError(null);
+    }
+
+    const runRefresh = async () => {
+      const sectionErrors: string[] = [];
+      const portalRole: Role = user?.login_portal || user?.role || 'student';
+      const shouldFetchStatic = !silent || !hasLoadedStaticRef.current;
+
+      const tasks: Promise<void>[] = [];
+
+      if (shouldFetchStatic) {
+        tasks.push(
+          request('/auth/me')
+            .then(meData => {
+              if (meData) {
+                const mergedUser: User = {
+                  ...meData,
+                  login_portal: user?.login_portal || meData.login_portal || meData.role,
+                };
+                setUser(mergedUser);
+                localStorage.setItem('user', JSON.stringify(mergedUser));
+              }
+            })
+            .catch(err => {
+              if (err.message !== 'Authentication expired') {
+                sectionErrors.push(err.message || 'Failed to verify profile');
+              }
+            })
+        );
+      }
+
+      // Independent concurrent dashboard section 1: Lessons / Sessions
+      tasks.push(
+        request('/lessons')
+          .then(lessonData => {
+            if (Array.isArray(lessonData)) {
+              setLessons(lessonData);
+              setHasLoadedLessons(true);
+              setLessonsLoadFailed(false);
+            }
+          })
+          .catch(err => {
+            if (err.message !== 'Authentication expired') {
+              setLessonsLoadFailed(true);
+              sectionErrors.push(err.message || 'Failed to load sessions');
+            }
+          })
+      );
+
+      // Independent concurrent dashboard section 2: Submissions
+      tasks.push(
+        request('/submissions')
+          .then(submissionData => {
+            if (Array.isArray(submissionData)) {
+              setSubmissions(submissionData);
+              setHasLoadedSubmissions(true);
+              setSubmissionsLoadFailed(false);
+            }
+          })
+          .catch(err => {
+            if (err.message !== 'Authentication expired') {
+              setSubmissionsLoadFailed(true);
+              sectionErrors.push(err.message || 'Failed to load submissions');
+            }
+          })
+      );
+
+      // Independent concurrent dashboard section 3: Analytics
+      tasks.push(
+        request('/analytics/dashboard')
+          .then(analyticsData => {
+            if (analyticsData) {
+              setAnalytics(analyticsData);
+              setHasLoadedAnalytics(true);
+              setAnalyticsLoadFailed(false);
+            }
+          })
+          .catch(err => {
+            if (err.message !== 'Authentication expired') {
+              setAnalyticsLoadFailed(true);
+              sectionErrors.push(err.message || 'Failed to load dashboard analytics');
+            }
+          })
+      );
+
+      // Independent concurrent dashboard section 4: Notifications
+      tasks.push(
+        request('/notifications')
+          .then(notifData => {
+            if (Array.isArray(notifData)) setNotifications(notifData);
+          })
+          .catch(() => {})
+      );
+
+      // Independent concurrent dashboard section 5: Contributor / Eligible Students
+      if (portalRole === 'contributor' || user?.role === 'contributor') {
+        tasks.push(
+          request('/contributor/assignments')
+            .then(contribData => {
+              if (Array.isArray(contribData)) {
+                setContributorAssignments(contribData);
+                setHasLoadedAssignments(true);
+                setAssignmentsLoadFailed(false);
+              }
+            })
+            .catch(err => {
+              if (err.message !== 'Authentication expired') {
+                setAssignmentsLoadFailed(true);
+                sectionErrors.push(err.message || 'Failed to load contributor assignments');
+              }
+            })
+        );
+        tasks.push(
+          request('/contributor/uploads')
+            .then(uploadHistoryData => {
+              if (Array.isArray(uploadHistoryData)) setContributorUploads(uploadHistoryData);
+            })
+            .catch(() => {})
+        );
+        if (shouldFetchStatic || studentsList.length === 0) {
+          tasks.push(
+            request('/contributors/eligible')
+              .then(eligibleRows => {
+                if (Array.isArray(eligibleRows)) {
+                  setStudentsList(eligibleRows);
+                  hasLoadedStaticRef.current = true;
+                }
+              })
+              .catch(() => {})
+          );
+        }
+      } else if (portalRole === 'faculty' && (shouldFetchStatic || studentsList.length === 0)) {
+        tasks.push(
+          request('/contributors/eligible')
+            .then(studentRows => {
+              if (Array.isArray(studentRows)) {
+                setStudentsList(studentRows);
+                hasLoadedStaticRef.current = true;
+              }
+            })
+            .catch(() => {})
+        );
+      } else {
+        hasLoadedStaticRef.current = true;
+      }
+
+      await Promise.allSettled(tasks);
+
+      if (sectionErrors.length > 0) {
+        const msg = sectionErrors[0];
+        setDashboardError(msg);
+        if (!silent) {
+          setNotice({ type: 'error', message: msg });
+        }
+      } else {
+        setDashboardError(null);
+      }
+    };
+
+    const p = runRefresh().finally(() => {
+      refreshInFlightRef.current = null;
+      setLoading(false);
+      setRefreshing(false);
+    });
+    refreshInFlightRef.current = p;
+    return p;
   }
 
   async function handleMarkNotificationRead(id: number) {
@@ -386,24 +566,48 @@ function App() {
     }
   }, [showNotificationPanel]);
 
+  // Initial fetch on sign-in (does NOT re-trigger on view navigation)
   useEffect(() => {
     if (token) {
-      refresh();
-      const hasProcessingSub = submissions.some(
-        s => s.assessment_status === 'processing' || s.assessment_status === 'pending'
-      );
-      const hasProcessingDoc =
-        contributorAssignments.some(
-          c => c.processing_status === 'processing' || c.processing_status === 'uploaded'
-        ) || lessons.some(l => l.readiness_status === 'processing_documents');
-
-      const pollDelay = hasProcessingSub || hasProcessingDoc ? 3000 : 8000;
-      const interval = setInterval(() => {
-        refresh(true);
-      }, pollDelay);
-      return () => clearInterval(interval);
+      refresh(false);
     }
-  }, [token, view]);
+  }, [token]);
+
+  const hasActiveProcessing = useMemo(() => {
+    const hasProcessingSub = submissions.some(
+      s => s.assessment_status === 'processing' || s.assessment_status === 'pending'
+    );
+    const hasProcessingDoc =
+      contributorAssignments.some(
+        c => c.processing_status === 'processing' || c.processing_status === 'uploaded'
+      ) || lessons.some(l => l.readiness_status === 'processing_documents');
+    return hasProcessingSub || hasProcessingDoc;
+  }, [submissions, contributorAssignments, lessons]);
+
+  // Non-overlapping background polling timer (waits for prior refresh to complete before scheduling next)
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    let timerId: ReturnType<typeof setTimeout> | null = null;
+    const pollDelay = hasActiveProcessing ? 4000 : 12000;
+
+    const scheduleNext = () => {
+      if (cancelled) return;
+      timerId = setTimeout(async () => {
+        if (cancelled) return;
+        if (typeof document === 'undefined' || document.visibilityState !== 'hidden') {
+          await refresh(true);
+        }
+        scheduleNext();
+      }, pollDelay);
+    };
+
+    scheduleNext();
+    return () => {
+      cancelled = true;
+      if (timerId !== null) clearTimeout(timerId);
+    };
+  }, [token, hasActiveProcessing]);
 
   useEffect(() => {
     if (selectedSubmission) {
@@ -698,6 +902,12 @@ function App() {
               students={studentsList}
               analytics={analytics}
               loading={loading}
+              refreshing={refreshing}
+              dashboardError={dashboardError}
+              hasLoadedLessons={hasLoadedLessons}
+              hasLoadedAssignments={hasLoadedAssignments}
+              lessonsLoadFailed={lessonsLoadFailed}
+              assignmentsLoadFailed={assignmentsLoadFailed}
               preselectedLessonId={preselectedContributorLessonId}
               setPreselectedLessonId={setPreselectedContributorLessonId}
               preselectedReflectionLessonId={preselectedLessonId}
@@ -719,6 +929,13 @@ function App() {
                   submissions={submissions}
                   analytics={analytics}
                   loading={loading}
+                  refreshing={refreshing}
+                  dashboardError={dashboardError}
+                  hasLoadedLessons={hasLoadedLessons}
+                  hasLoadedSubmissions={hasLoadedSubmissions}
+                  lessonsLoadFailed={lessonsLoadFailed}
+                  submissionsLoadFailed={submissionsLoadFailed}
+                  onRetry={() => refresh(false)}
                   onStartReflection={lessonId => {
                     setPreselectedLessonId(lessonId);
                     setView('submit');
@@ -748,8 +965,8 @@ function App() {
                   initialLessonId={preselectedLessonId}
                   request={request}
                   onDone={() => {
-                    refresh();
                     setView('submissions');
+                    refresh();
                     setNotice({ type: 'success', message: 'Reflection submitted for assessment.' });
                   }}
                   onError={msg => setNotice({ type: 'error', message: msg })}
@@ -787,6 +1004,15 @@ function App() {
                   submissions={submissions}
                   analytics={analytics}
                   loading={loading}
+                  refreshing={refreshing}
+                  dashboardError={dashboardError}
+                  hasLoadedLessons={hasLoadedLessons}
+                  hasLoadedSubmissions={hasLoadedSubmissions}
+                  hasLoadedAnalytics={hasLoadedAnalytics}
+                  lessonsLoadFailed={lessonsLoadFailed}
+                  submissionsLoadFailed={submissionsLoadFailed}
+                  analyticsLoadFailed={analyticsLoadFailed}
+                  onRetry={() => refresh(false)}
                   onNavigate={setView}
                   onSelectSubmission={setSelectedSubmission}
                 />
@@ -1158,6 +1384,15 @@ function FacultyDashboardOverview({
   submissions,
   analytics,
   loading,
+  refreshing = false,
+  dashboardError = null,
+  hasLoadedLessons = true,
+  hasLoadedSubmissions = true,
+  hasLoadedAnalytics = true,
+  lessonsLoadFailed = false,
+  submissionsLoadFailed = false,
+  analyticsLoadFailed = false,
+  onRetry,
   onNavigate,
   onSelectSubmission,
 }: {
@@ -1165,6 +1400,15 @@ function FacultyDashboardOverview({
   submissions: Submission[];
   analytics: DashboardAnalyticsResponse | null;
   loading: boolean;
+  refreshing?: boolean;
+  dashboardError?: string | null;
+  hasLoadedLessons?: boolean;
+  hasLoadedSubmissions?: boolean;
+  hasLoadedAnalytics?: boolean;
+  lessonsLoadFailed?: boolean;
+  submissionsLoadFailed?: boolean;
+  analyticsLoadFailed?: boolean;
+  onRetry?: () => void;
   onNavigate: (view: string) => void;
   onSelectSubmission: (sub: Submission) => void;
 }) {
@@ -1174,12 +1418,26 @@ function FacultyDashboardOverview({
   );
   const avgRating = completed.length
     ? (completed.reduce((acc, curr) => acc + (curr.rating || 0), 0) / completed.length).toFixed(1)
-    : null;
+    : analytics?.average_rating != null
+      ? Number(analytics.average_rating).toFixed(1)
+      : null;
 
   const ratingDist = analytics?.rating_distribution || [];
   const completionData = (analytics?.submission_completion || []).filter(item => item.value > 0);
   const sessionComp = analytics?.session_comparison || [];
   const conceptCov = analytics?.concept_coverage || [];
+
+  // Never display 0 when the initial API request failed or is still loading
+  const showLessonsSkeleton = (loading || lessonsLoadFailed) && !hasLoadedLessons;
+  const showSubmissionsSkeleton = (loading || submissionsLoadFailed) && !hasLoadedSubmissions;
+  const showAnalyticsSkeleton = (loading || analyticsLoadFailed) && !hasLoadedAnalytics;
+
+  const readySessionsCount =
+    analytics?.ready_sessions != null
+      ? analytics.ready_sessions
+      : hasLoadedLessons
+        ? lessons.filter(l => l.assessment_mode !== 'c4' || l.readiness_status === 'ready_for_assessment').length
+        : null;
 
   return (
     <>
@@ -1190,26 +1448,66 @@ function FacultyDashboardOverview({
             Monitor sessions, contributor reference-report readiness, student reflections, and assessment analytics.
           </p>
         </div>
-        <button className="btn btn-primary" onClick={() => onNavigate('lessons')}>
-          <Plus size={15} />
-          <span>Manage Sessions</span>
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          {onRetry && (
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              onClick={onRetry}
+              disabled={loading || refreshing}
+              title="Refresh dashboard data"
+            >
+              {loading || refreshing ? <Loader2 size={14} className="spin" /> : <RotateCcw size={14} />}
+              <span>{refreshing ? 'Refreshing...' : 'Refresh'}</span>
+            </button>
+          )}
+          <button className="btn btn-primary" onClick={() => onNavigate('lessons')}>
+            <Plus size={15} />
+            <span>Manage Sessions</span>
+          </button>
+        </div>
       </div>
+
+      {dashboardError && (
+        <div className="form-error-alert" role="alert" style={{ marginBottom: '16px' }}>
+          <AlertCircle size={15} />
+          <span>{dashboardError}</span>
+          {onRetry && (
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              style={{ marginLeft: 'auto' }}
+              onClick={onRetry}
+            >
+              <RotateCcw size={12} />
+              <span>Retry</span>
+            </button>
+          )}
+        </div>
+      )}
 
       <div className="kpi-grid">
         <div className="kpi-card">
           <span className="kpi-label">Published Sessions</span>
-          <span className="kpi-value">{loading ? '—' : lessons.length}</span>
-          <span className="kpi-meta">{analytics?.ready_sessions ?? 0} ready for assessment</span>
+          <span className="kpi-value">{showLessonsSkeleton ? '—' : lessons.length}</span>
+          <span className="kpi-meta">
+            {readySessionsCount !== null && !showAnalyticsSkeleton
+              ? `${readySessionsCount} ready for assessment`
+              : showLessonsSkeleton
+                ? '—'
+                : `${readySessionsCount ?? '—'} ready for assessment`}
+          </span>
         </div>
         <div className="kpi-card">
           <span className="kpi-label">Total Submissions</span>
-          <span className="kpi-value">{loading ? '—' : submissions.length}</span>
+          <span className="kpi-value">{showSubmissionsSkeleton ? '—' : submissions.length}</span>
         </div>
         <div className="kpi-card">
           <span className="kpi-label">Evaluated</span>
-          <span className="kpi-value">{loading ? '—' : completed.length}</span>
-          {pending.length > 0 && <span className="kpi-meta">{pending.length} processing</span>}
+          <span className="kpi-value">{showSubmissionsSkeleton ? '—' : completed.length}</span>
+          {!showSubmissionsSkeleton && pending.length > 0 && (
+            <span className="kpi-meta">{pending.length} processing</span>
+          )}
         </div>
         <div className="kpi-card">
           <span className="kpi-label">Average C4 Rating</span>
@@ -1710,6 +2008,19 @@ function FacultyLessonsView({
     }
   }
 
+  async function handleApprovePool(lessonId: number) {
+    try {
+      const updatedPool = await request(`/lessons/${lessonId}/keyword-pool/review`, {
+        method: 'POST',
+        body: JSON.stringify({ action: 'approve' }),
+      });
+      setPoolMap(prev => ({ ...prev, [lessonId]: updatedPool }));
+      onSuccess('Normalized concept pool reviewed and approved.');
+    } catch (err: any) {
+      onError(err.message || 'Failed to approve concept pool');
+    }
+  }
+
   return (
     <>
       <div className="page-header">
@@ -1994,25 +2305,186 @@ function FacultyLessonsView({
                         </div>
 
                         {poolInfo?.pool_ready && (
-                          <div style={{ borderTop: '1px solid var(--border)', paddingTop: '10px' }}>
-                            <span
-                              style={{
-                                fontSize: '12px',
-                                fontWeight: 600,
-                                color: 'var(--text)',
-                                display: 'block',
-                                marginBottom: '6px',
-                              }}
-                            >
-                              Active Reference Pool ({poolInfo.distinct_concepts_count} concepts)
-                            </span>
-                            <div className="concept-tag-list">
-                              {poolInfo.distinct_concepts.map((dc, i) => (
-                                <span key={i} className="concept-pill">
-                                  {dc.display_concept}
+                          <div style={{ borderTop: '1px solid var(--border)', paddingTop: '12px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                            {/* Pool Normalization Summary Metrics */}
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
+                              <div>
+                                <span style={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--text)' }}>
+                                  C4 Canonical Concept Pool
                                 </span>
-                              ))}
+                                <span style={{ fontSize: '11.5px', color: 'var(--text-muted)', marginLeft: '8px' }}>
+                                  Original Extracted Entries: <strong>{poolInfo.total_raw_keywords || 15}</strong> · Normalized Unique Concepts: <strong>{poolInfo.distinct_concepts_count}</strong> · Merged Duplicates: <strong>{poolInfo.merged_entries_count ?? Math.max(0, (poolInfo.total_raw_keywords || 15) - poolInfo.distinct_concepts_count)}</strong>
+                                </span>
+                              </div>
+                              {!isContributorManager && (
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                  <span
+                                    className={`badge ${
+                                      poolInfo.review_status === 'approved' ? 'badge-completed' : 'badge-processing'
+                                    }`}
+                                  >
+                                    <span className="badge-dot" />
+                                    <span>
+                                      {poolInfo.review_status === 'approved'
+                                        ? `Reviewed${poolInfo.reviewed_by ? ` by ${poolInfo.reviewed_by}` : ''}`
+                                        : 'Pending Faculty Review'}
+                                    </span>
+                                  </span>
+                                  {poolInfo.review_status !== 'approved' && (
+                                    <button
+                                      type="button"
+                                      className="btn btn-secondary btn-sm"
+                                      onClick={() => handleApprovePool(lesson.id)}
+                                    >
+                                      <CheckCircle2 size={12} />
+                                      <span>Approve Pool</span>
+                                    </button>
+                                  )}
+                                </div>
+                              )}
                             </div>
+
+                            {/* Normalized Unique Canonical Concepts */}
+                            {poolInfo.distinct_concepts.length > 0 && (
+                              <div>
+                                <span
+                                  style={{
+                                    fontSize: '11.5px',
+                                    fontWeight: 600,
+                                    color: 'var(--text-secondary)',
+                                    display: 'block',
+                                    marginBottom: '6px',
+                                  }}
+                                >
+                                  Normalized Unique Concepts ({poolInfo.distinct_concepts_count})
+                                </span>
+                                <div className="concept-tag-list">
+                                  {poolInfo.distinct_concepts.map((dc, i) => {
+                                    const contributorsLabel =
+                                      dc.source_contributor_names && dc.source_contributor_names.length > 0
+                                        ? dc.source_contributor_names.join(', ')
+                                        : dc.source_contributor_ids.map(id => `#${id}`).join(', ');
+                                    return (
+                                      <span
+                                        key={i}
+                                        className="concept-pill"
+                                        title={
+                                          dc.occurrence_count > 1
+                                            ? `Merged (${dc.occurrence_count} entries): ${(dc.original_terms || dc.surface_forms).join(' + ')} | Contributors: ${contributorsLabel}`
+                                            : `Contributor: ${contributorsLabel}`
+                                        }
+                                      >
+                                        <strong>{dc.canonical_concept || dc.display_concept}</strong>
+                                        {dc.occurrence_count > 1 && (
+                                          <span style={{ fontSize: '10.5px', color: 'var(--accent)', marginLeft: '5px' }}>
+                                            (Merged ×{dc.occurrence_count})
+                                          </span>
+                                        )}
+                                        {contributorsLabel && (
+                                          <span style={{ fontSize: '10.5px', color: 'var(--text-muted)', marginLeft: '5px' }}>
+                                            · {contributorsLabel}
+                                          </span>
+                                        )}
+                                      </span>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            )}
+
+                            {/* Duplicate and Merged Keyword Entries */}
+                            {poolInfo.duplicate_concepts && poolInfo.duplicate_concepts.length > 0 && (
+                              <div
+                                style={{
+                                  padding: '8px 10px',
+                                  borderRadius: 'var(--radius-sm)',
+                                  backgroundColor: 'var(--bg-subtle)',
+                                  border: '1px solid var(--border)',
+                                }}
+                              >
+                                <span
+                                  style={{
+                                    fontSize: '11.5px',
+                                    fontWeight: 600,
+                                    color: 'var(--text)',
+                                    display: 'block',
+                                    marginBottom: '4px',
+                                  }}
+                                >
+                                  Duplicate & Merged Keyword Entries ({poolInfo.duplicate_concepts.length} canonical group(s))
+                                </span>
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                                  {poolInfo.duplicate_concepts.map((dup, idx) => (
+                                    <div key={idx} style={{ fontSize: '11.5px', color: 'var(--text-secondary)' }}>
+                                      <strong>{dup.canonical_concept || dup.display_concept}</strong> ← Merged from:{' '}
+                                      {dup.merged_entries && dup.merged_entries.length > 0
+                                        ? dup.merged_entries
+                                            .map(
+                                              me =>
+                                                `"${me.raw_keyword}" (${me.contributor_name || `Contributor #${me.contributor_id}`})`
+                                            )
+                                            .join(' + ')
+                                        : (dup.original_terms || dup.surface_forms).map(t => `"${t}"`).join(' + ')}
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+
+                            {/* All 15 Original Extracted Entries with Contributor Attribution */}
+                            {poolInfo.source_entries && poolInfo.source_entries.length > 0 && (
+                              <div>
+                                <span
+                                  style={{
+                                    fontSize: '11.5px',
+                                    fontWeight: 600,
+                                    color: 'var(--text-secondary)',
+                                    display: 'block',
+                                    marginBottom: '6px',
+                                  }}
+                                >
+                                  Original Extracted Entries ({poolInfo.source_entries.length} / 15 Preserved with Contributor Attribution)
+                                </span>
+                                <div
+                                  style={{
+                                    display: 'grid',
+                                    gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))',
+                                    gap: '6px',
+                                  }}
+                                >
+                                  {poolInfo.source_entries.map((se, idx) => (
+                                    <div
+                                      key={idx}
+                                      style={{
+                                        fontSize: '11.5px',
+                                        padding: '5px 8px',
+                                        borderRadius: 'var(--radius-sm)',
+                                        backgroundColor: 'var(--bg-subtle)',
+                                        border: '1px solid var(--border)',
+                                        display: 'flex',
+                                        flexDirection: 'column',
+                                        gap: '2px',
+                                      }}
+                                    >
+                                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: '4px' }}>
+                                        <strong style={{ color: 'var(--text)' }}>
+                                          #{idx + 1}. {se.raw_keyword}
+                                        </strong>
+                                        {se.is_merged && (
+                                          <span style={{ fontSize: '10px', color: 'var(--accent)' }}>Merged</span>
+                                        )}
+                                      </div>
+                                      <span style={{ fontSize: '10.5px', color: 'var(--text-muted)' }}>
+                                        {se.contributor_name || `Contributor #${se.contributor_id}`} (Kw #{se.position})
+                                        {se.canonical_concept && se.canonical_concept !== se.raw_keyword
+                                          ? ` → ${se.canonical_concept}`
+                                          : ''}
+                                      </span>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
                           </div>
                         )}
                       </>
@@ -2245,6 +2717,12 @@ function ContributorPortalWorkspace({
   students,
   analytics,
   loading,
+  refreshing = false,
+  dashboardError = null,
+  hasLoadedLessons = true,
+  hasLoadedAssignments = true,
+  lessonsLoadFailed = false,
+  assignmentsLoadFailed = false,
   preselectedLessonId,
   setPreselectedLessonId,
   preselectedReflectionLessonId,
@@ -2266,6 +2744,12 @@ function ContributorPortalWorkspace({
   students: StudentOption[];
   analytics: DashboardAnalyticsResponse | null;
   loading: boolean;
+  refreshing?: boolean;
+  dashboardError?: string | null;
+  hasLoadedLessons?: boolean;
+  hasLoadedAssignments?: boolean;
+  lessonsLoadFailed?: boolean;
+  assignmentsLoadFailed?: boolean;
   preselectedLessonId: number | null;
   setPreselectedLessonId: (id: number | null) => void;
   preselectedReflectionLessonId: number | null;
@@ -3247,24 +3731,49 @@ function ContributorPortalWorkspace({
         </div>
       </div>
 
+      {dashboardError && (
+        <div className="form-error-alert" role="alert" style={{ marginBottom: '16px' }}>
+          <AlertCircle size={15} />
+          <span>{dashboardError}</span>
+          <button
+            type="button"
+            className="btn btn-secondary btn-sm"
+            style={{ marginLeft: 'auto' }}
+            onClick={() => onRefresh()}
+            disabled={loading || refreshing}
+          >
+            <RotateCcw size={12} />
+            <span>Retry</span>
+          </button>
+        </div>
+      )}
+
       <div className="kpi-grid">
         <div className="kpi-card">
           <span className="kpi-label">Assigned Sessions</span>
-          <span className="kpi-value">{loading ? '—' : assignments.length}</span>
+          <span className="kpi-value">
+            {(loading || assignmentsLoadFailed) && !hasLoadedAssignments ? '—' : assignments.length}
+          </span>
         </div>
         <div className="kpi-card">
           <span className="kpi-label">Reports Submitted</span>
           <span className="kpi-value">
-            {loading ? '—' : `${uploadedCount} / ${assignments.length}`}
+            {(loading || assignmentsLoadFailed) && !hasLoadedAssignments
+              ? '—'
+              : `${uploadedCount} / ${assignments.length}`}
           </span>
         </div>
         <div className="kpi-card">
           <span className="kpi-label">Processed Successfully</span>
-          <span className="kpi-value">{loading ? '—' : completedCount}</span>
+          <span className="kpi-value">
+            {(loading || assignmentsLoadFailed) && !hasLoadedAssignments ? '—' : completedCount}
+          </span>
         </div>
         <div className="kpi-card">
           <span className="kpi-label">Sessions Created by You</span>
-          <span className="kpi-value">{loading ? '—' : managedLessons.length}</span>
+          <span className="kpi-value">
+            {(loading || lessonsLoadFailed) && !hasLoadedLessons ? '—' : managedLessons.length}
+          </span>
         </div>
       </div>
 
@@ -3613,6 +4122,13 @@ function StudentDashboardOverview({
   submissions,
   analytics,
   loading,
+  refreshing = false,
+  dashboardError = null,
+  hasLoadedLessons = true,
+  hasLoadedSubmissions = true,
+  lessonsLoadFailed = false,
+  submissionsLoadFailed = false,
+  onRetry,
   onStartReflection,
   onSelectSubmission,
   onNavigate,
@@ -3621,6 +4137,13 @@ function StudentDashboardOverview({
   submissions: Submission[];
   analytics: DashboardAnalyticsResponse | null;
   loading: boolean;
+  refreshing?: boolean;
+  dashboardError?: string | null;
+  hasLoadedLessons?: boolean;
+  hasLoadedSubmissions?: boolean;
+  lessonsLoadFailed?: boolean;
+  submissionsLoadFailed?: boolean;
+  onRetry?: () => void;
   onStartReflection: (lessonId: number) => void;
   onSelectSubmission: (sub: Submission) => void;
   onNavigate: (view: string) => void;
@@ -3630,6 +4153,9 @@ function StudentDashboardOverview({
   const personalCompletion = analytics?.personal_completion || [];
   const PIE_COLORS = ['#6366f1', '#94a3b8'];
 
+  const showLessonsSkeleton = (loading || lessonsLoadFailed) && !hasLoadedLessons;
+  const showSubmissionsSkeleton = (loading || submissionsLoadFailed) && !hasLoadedSubmissions;
+
   return (
     <>
       <div className="page-header">
@@ -3637,24 +4163,56 @@ function StudentDashboardOverview({
           <h1 className="page-title">Student Dashboard</h1>
           <p className="page-description">View available sessions, submit reflections, and check your results.</p>
         </div>
-        <button className="btn btn-primary" onClick={() => onNavigate('submit')}>
-          <Send size={14} />
-          <span>Submit Reflection</span>
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          {onRetry && (
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              onClick={onRetry}
+              disabled={loading || refreshing}
+              title="Refresh dashboard data"
+            >
+              {loading || refreshing ? <Loader2 size={14} className="spin" /> : <RotateCcw size={14} />}
+              <span>{refreshing ? 'Refreshing...' : 'Refresh'}</span>
+            </button>
+          )}
+          <button className="btn btn-primary" onClick={() => onNavigate('submit')}>
+            <Send size={14} />
+            <span>Submit Reflection</span>
+          </button>
+        </div>
       </div>
+
+      {dashboardError && (
+        <div className="form-error-alert" role="alert" style={{ marginBottom: '16px' }}>
+          <AlertCircle size={15} />
+          <span>{dashboardError}</span>
+          {onRetry && (
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              style={{ marginLeft: 'auto' }}
+              onClick={onRetry}
+            >
+              <RotateCcw size={12} />
+              <span>Retry</span>
+            </button>
+          )}
+        </div>
+      )}
 
       <div className="kpi-grid">
         <div className="kpi-card">
           <span className="kpi-label">Available Sessions</span>
-          <span className="kpi-value">{loading ? '—' : lessons.length}</span>
+          <span className="kpi-value">{showLessonsSkeleton ? '—' : lessons.length}</span>
         </div>
         <div className="kpi-card">
           <span className="kpi-label">Submitted Reflections</span>
-          <span className="kpi-value">{loading ? '—' : submissions.length}</span>
+          <span className="kpi-value">{showSubmissionsSkeleton ? '—' : submissions.length}</span>
         </div>
         <div className="kpi-card">
           <span className="kpi-label">Assessment Results</span>
-          <span className="kpi-value">{loading ? '—' : completed.length}</span>
+          <span className="kpi-value">{showSubmissionsSkeleton ? '—' : completed.length}</span>
         </div>
       </div>
 
@@ -4676,9 +5234,12 @@ function SubmissionDetailDrawer({
   onError: (msg: string) => void;
 }) {
   const [retrying, setRetrying] = useState(false);
+  const [acceptingReview, setAcceptingReview] = useState(false);
 
   const details = submission.assessment_details || {};
   const conceptResults: ConceptResult[] = faculty ? details.concept_results || [] : [];
+  const matchedConceptsList: C4MatchedConceptItem[] = faculty ? details.matched_concepts || [] : [];
+  const unmatchedConceptsList: C4MatchedConceptItem[] = faculty ? details.unmatched_concepts || [] : [];
   const missingConcepts: string[] = faculty ? details.missing_concepts || [] : [];
   const misconceptions: string[] = faculty ? details.misconceptions || [] : [];
   const strengths: string[] = details.strengths || [];
@@ -4689,6 +5250,9 @@ function SubmissionDetailDrawer({
 
   const matchedCount = submission.matched_concepts_count ?? details.matched_count ?? null;
   const totalPoolCount = submission.total_pool_concepts ?? details.total_distinct_concepts ?? 15;
+  const totalRawKeywords = details.total_raw_keywords ?? 15;
+  const coveragePct = details.coverage_percentage ?? submission.recall_percentage ?? 0;
+  const reviewStatus = details.review_status || 'pending_review';
 
   async function handleAssess() {
     setRetrying(true);
@@ -4699,6 +5263,21 @@ function SubmissionDetailDrawer({
       onError(err.message || 'Assessment request failed');
     } finally {
       setRetrying(false);
+    }
+  }
+
+  async function handleAcceptReview() {
+    setAcceptingReview(true);
+    try {
+      await request(`/submissions/${submission.id}/review`, {
+        method: 'POST',
+        body: JSON.stringify({ action: 'accept' }),
+      });
+      await onRefresh();
+    } catch (err: any) {
+      onError(err.message || 'Failed to accept assessment review');
+    } finally {
+      setAcceptingReview(false);
     }
   }
 
@@ -4742,14 +5321,47 @@ function SubmissionDetailDrawer({
 
           {isCompleted && (
             <div className="drawer-section">
-              <span className="drawer-section-title">Assessment Summary</span>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                <span className="drawer-section-title" style={{ marginBottom: 0 }}>Assessment Summary</span>
+                {faculty && isC4 && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <span
+                      className={`badge ${reviewStatus === 'accepted' ? 'badge-completed' : 'badge-processing'}`}
+                    >
+                      <span className="badge-dot" />
+                      <span>
+                        {reviewStatus === 'accepted'
+                          ? `Accepted${details.reviewed_by ? ` by ${details.reviewed_by}` : ''}`
+                          : 'Pending Faculty Review'}
+                      </span>
+                    </span>
+                    {reviewStatus !== 'accepted' && (
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={handleAcceptReview}
+                        disabled={acceptingReview}
+                      >
+                        {acceptingReview ? (
+                          <Loader2 size={12} className="spin" />
+                        ) : (
+                          <>
+                            <CheckCircle2 size={12} />
+                            <span>Accept Result</span>
+                          </>
+                        )}
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
               <div className="score-summary-grid">
                 <div className="score-box">
-                  <span className="score-box-label">Rating</span>
+                  <span className="score-box-label">Final Rating</span>
                   <span className="score-box-value">{submission.rating} / 5</span>
                 </div>
                 <div className="score-box">
-                  <span className="score-box-label">{isC4 ? 'Matched Concepts' : 'Recall'}</span>
+                  <span className="score-box-label">{isC4 ? 'Canonical Concepts' : 'Recall'}</span>
                   <span className="score-box-value">
                     {isC4 && matchedCount !== null
                       ? `${matchedCount} / ${totalPoolCount}`
@@ -4758,9 +5370,14 @@ function SubmissionDetailDrawer({
                 </div>
                 <div className="score-box">
                   <span className="score-box-label">Coverage</span>
-                  <span className="score-box-value">{submission.recall_percentage}%</span>
+                  <span className="score-box-value">{coveragePct}%</span>
                 </div>
               </div>
+              {faculty && isC4 && (
+                <div style={{ fontSize: '11.5px', color: 'var(--text-muted)', marginTop: '6px' }}>
+                  Original Extracted Entries: <strong>{totalRawKeywords}</strong> · Normalized Canonical Pool: <strong>{totalPoolCount}</strong> (Max 1 mark per canonical concept) · Rating Bands: 0–20%=1, &gt;20–40%=2, &gt;40–60%=3, &gt;60–80%=4, &gt;80–100%=5
+                </div>
+              )}
             </div>
           )}
 
@@ -4805,51 +5422,123 @@ function SubmissionDetailDrawer({
             </div>
           )}
 
-          {/* FACULTY-ONLY CONCEPT BREAKDOWN */}
-          {faculty && isCompleted && conceptResults.length > 0 && (
-            <div className="drawer-section">
-              <span className="drawer-section-title">Concept Breakdown (Faculty Only)</span>
-              <div className="concept-grid">
-                {conceptResults.map((cr, idx) => (
-                  <div className="concept-card" key={idx}>
-                    <div className="concept-card-top">
-                      <span className="concept-name">{cr.concept}</span>
-                      <ConceptStatusBadge status={cr.status} />
-                    </div>
-                    {cr.evidence && <div className="concept-evidence">“{cr.evidence}”</div>}
-                    {cr.explanation && <span className="concept-explanation">{cr.explanation}</span>}
+          {/* FACULTY-ONLY MATCHED & UNMATCHED CANONICAL CONCEPTS */}
+          {faculty && isCompleted && isC4 && (matchedConceptsList.length > 0 || unmatchedConceptsList.length > 0) ? (
+            <>
+              <div className="drawer-section">
+                <span className="drawer-section-title">
+                  Matched Canonical Concepts ({matchedConceptsList.length} / {totalPoolCount}) — Supporting Evidence
+                </span>
+                {matchedConceptsList.length === 0 ? (
+                  <p style={{ fontSize: '12.5px', color: 'var(--text-muted)' }}>
+                    No canonical concepts were demonstrated with understanding in this reflection.
+                  </p>
+                ) : (
+                  <div className="concept-grid">
+                    {matchedConceptsList.map((mc, idx) => (
+                      <div className="concept-card" key={idx}>
+                        <div className="concept-card-top">
+                          <span className="concept-name">{mc.canonical_concept || mc.concept}</span>
+                          <ConceptStatusBadge status="recalled" />
+                        </div>
+                        {mc.original_terms && mc.original_terms.length > 1 && (
+                          <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                            Merged terms: {mc.original_terms.join(' + ')}
+                          </div>
+                        )}
+                        {mc.source_contributor_names && mc.source_contributor_names.length > 0 && (
+                          <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                            Contributor(s): {mc.source_contributor_names.join(', ')}
+                          </div>
+                        )}
+                        {mc.evidence && (
+                          <div className="concept-evidence">
+                            <strong>Evidence:</strong> “{mc.evidence}”
+                          </div>
+                        )}
+                        {mc.explanation && <span className="concept-explanation">{mc.explanation}</span>}
+                      </div>
+                    ))}
                   </div>
-                ))}
+                )}
               </div>
-            </div>
-          )}
 
-          {faculty && isCompleted && (missingConcepts.length > 0 || misconceptions.length > 0) && (
-            <div className="drawer-section">
-              <span className="drawer-section-title">Unmatched / Misconceptions (Faculty Only)</span>
-              {missingConcepts.length > 0 && (
-                <div className="concept-tag-list">
-                  {missingConcepts.map((c, i) => (
-                    <span key={i} className="concept-pill">
-                      {c}
-                    </span>
-                  ))}
+              <div className="drawer-section">
+                <span className="drawer-section-title">
+                  Unmatched Canonical Concepts ({unmatchedConceptsList.length} / {totalPoolCount})
+                </span>
+                {unmatchedConceptsList.length === 0 ? (
+                  <p style={{ fontSize: '12.5px', color: 'var(--text-muted)' }}>
+                    All canonical concepts in the pool were matched!
+                  </p>
+                ) : (
+                  <div className="concept-grid">
+                    {unmatchedConceptsList.map((uc, idx) => (
+                      <div className="concept-card" key={idx}>
+                        <div className="concept-card-top">
+                          <span className="concept-name">{uc.canonical_concept || uc.concept}</span>
+                          <ConceptStatusBadge status="missing" />
+                        </div>
+                        {uc.original_terms && uc.original_terms.length > 1 && (
+                          <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                            Merged terms: {uc.original_terms.join(' + ')}
+                          </div>
+                        )}
+                        {uc.explanation && <span className="concept-explanation">{uc.explanation}</span>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            <>
+              {faculty && isCompleted && conceptResults.length > 0 && (
+                <div className="drawer-section">
+                  <span className="drawer-section-title">Concept Breakdown (Faculty Only)</span>
+                  <div className="concept-grid">
+                    {conceptResults.map((cr, idx) => (
+                      <div className="concept-card" key={idx}>
+                        <div className="concept-card-top">
+                          <span className="concept-name">{cr.concept}</span>
+                          <ConceptStatusBadge status={cr.status} />
+                        </div>
+                        {cr.evidence && <div className="concept-evidence">“{cr.evidence}”</div>}
+                        {cr.explanation && <span className="concept-explanation">{cr.explanation}</span>}
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
-              {misconceptions.length > 0 && (
-                <div className="concept-tag-list" style={{ marginTop: '4px' }}>
-                  {misconceptions.map((m, i) => (
-                    <span
-                      key={i}
-                      className="concept-pill"
-                      style={{ color: 'var(--danger)', borderColor: 'var(--danger-border)' }}
-                    >
-                      {m}
-                    </span>
-                  ))}
+
+              {faculty && isCompleted && (missingConcepts.length > 0 || misconceptions.length > 0) && (
+                <div className="drawer-section">
+                  <span className="drawer-section-title">Unmatched / Misconceptions (Faculty Only)</span>
+                  {missingConcepts.length > 0 && (
+                    <div className="concept-tag-list">
+                      {missingConcepts.map((c, i) => (
+                        <span key={i} className="concept-pill">
+                          {c}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {misconceptions.length > 0 && (
+                    <div className="concept-tag-list" style={{ marginTop: '4px' }}>
+                      {misconceptions.map((m, i) => (
+                        <span
+                          key={i}
+                          className="concept-pill"
+                          style={{ color: 'var(--danger)', borderColor: 'var(--danger-border)' }}
+                        >
+                          {m}
+                        </span>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
-            </div>
+            </>
           )}
 
           {isFailed && (
